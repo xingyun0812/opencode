@@ -38,12 +38,36 @@ import {
 } from "../groups/session"
 import { PermissionNotFoundError } from "../errors"
 import * as SessionError from "./session-errors"
+import { UserContext } from "@opencode-ai/schema/user-context"
+import { DataRootConfig } from "@opencode-ai/server/data-root"
+import { workspacePath } from "@opencode-ai/core/workspace-path"
 
 const tryParseJson = (text: string) =>
   Effect.try({
     try: () => JSON.parse(text) as unknown,
     catch: () => new HttpApiError.BadRequest({}),
   })
+
+/**
+ * Resolves the workspace directory for a new session.
+ * Priority:
+ *   1. request location.directory (non-empty string)
+ *   2. UserContext exists → workspacePath(userID, dataRoot)
+ *   3. fallback → undefined (caller will use ctx.directory)
+ */
+function resolveWorkspaceDirectory(
+  location: string | undefined,
+): Effect.Effect<string | undefined, never> {
+  if (location) return Effect.succeed(location)
+  return Effect.gen(function* () {
+    const userCtx = yield* Effect.serviceOption(UserContext.Service)
+    if (Option.isSome(userCtx) && userCtx.value.userID) {
+      const dataRoot = yield* DataRootConfig
+      return workspacePath(userCtx.value.userID, dataRoot)
+    }
+    return undefined
+  })
+}
 
 export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", (handlers) =>
   Effect.gen(function* () {
@@ -152,7 +176,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       )
     })
 
-    const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput }) {
+    const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput, directory?: string }) {
+      if (ctx.directory) {
+        return yield* session.create({ ...ctx.payload, directory: ctx.directory })
+      }
       return yield* shareSvc.create(ctx.payload)
     })
 
@@ -166,13 +193,15 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       const decoded = yield* Schema.decodeUnknownEffect(Session.CreateInput)(json).pipe(
         Effect.mapError(() => new HttpApiError.BadRequest({})),
       )
+      const location = typeof json === "object" && json !== null ? (json as Record<string, unknown>).location as string | undefined : undefined
+      const effectiveDirectory = location && typeof location === "string" && location.length > 0 ? yield* resolveWorkspaceDirectory(location) : yield* resolveWorkspaceDirectory(undefined)
       const payload = decoded
         ? {
             ...decoded,
             permission: decoded.permission ? [...decoded.permission] : undefined,
           }
         : decoded
-      return yield* create({ payload })
+      return yield* create({ payload, directory: effectiveDirectory })
     })
 
     const remove = Effect.fn("SessionHttpApi.remove")(function* (ctx: { params: { sessionID: SessionID } }) {

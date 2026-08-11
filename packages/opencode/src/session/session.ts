@@ -38,6 +38,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
+import { UserContext } from "@opencode-ai/schema/user-context"
 import { Effect, Layer, Option, Context, Schema, Types } from "effect"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -114,6 +115,8 @@ export function fromRow(row: SessionRow): Info {
       compacting: row.time_compacting ?? undefined,
       archived: row.time_archived ?? undefined,
     },
+    userID: row.user_id ?? undefined,
+    userDepartmentCode: row.user_department_code ?? undefined,
   }
 }
 
@@ -155,6 +158,8 @@ export function toRow(info: Info) {
     time_updated: info.time.updated,
     time_compacting: info.time.compacting,
     time_archived: info.time.archived,
+    user_id: info.userID,
+    user_department_code: info.userDepartmentCode,
   }
 }
 
@@ -241,6 +246,8 @@ export const Info = Schema.Struct({
   time: Time,
   permission: optional(PermissionV1.Ruleset),
   revert: optional(Revert),
+  userID: optional(Schema.String),
+  userDepartmentCode: optional(Schema.String),
 }).annotate({ identifier: "Session" })
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
 
@@ -509,6 +516,8 @@ const layer: Layer.Layer<
       path?: string
       metadata?: typeof Metadata.Type
       permission?: PermissionV1.Ruleset
+      userID?: string
+      userDepartmentCode?: string
     }) {
       const ctx = yield* InstanceState.context
       const result: Info = {
@@ -531,6 +540,8 @@ const layer: Layer.Layer<
           created: Date.now(),
           updated: Date.now(),
         },
+        userID: input.userID,
+        userDepartmentCode: input.userDepartmentCode,
       }
       yield* Effect.logInfo("created", result)
 
@@ -674,19 +685,26 @@ const layer: Layer.Layer<
       metadata?: typeof Metadata.Type
       permission?: PermissionV1.Ruleset
       workspaceID?: WorkspaceV2.ID
+      directory?: string
     }) {
       const ctx = yield* InstanceState.context
       const workspace = yield* InstanceState.workspaceID
+      const effectiveDirectory = input?.directory ?? ctx.directory
+      const userCtx = yield* Effect.serviceOption(UserContext.Service)
+      const userID = Option.isSome(userCtx) ? userCtx.value.userID : undefined
+      const departmentCode = Option.isSome(userCtx) ? userCtx.value.departmentCode : undefined
       return yield* createNext({
         parentID: input?.parentID,
-        directory: ctx.directory,
-        path: sessionPath(ctx.worktree, ctx.directory),
+        directory: effectiveDirectory,
+        path: sessionPath(ctx.worktree, effectiveDirectory),
         title: input?.title,
         agent: input?.agent,
         model: input?.model,
         metadata: input?.metadata,
         permission: input?.permission,
         workspaceID: input?.workspaceID ?? workspace,
+        userID,
+        userDepartmentCode: departmentCode,
       })
     })
 
