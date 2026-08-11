@@ -1,7 +1,6 @@
 import { ServerAuth } from "@/server/auth"
 import { UserContext } from "@opencode-ai/schema/user-context"
 import { UnauthorizedError } from "@opencode-ai/protocol/errors"
-import { ServerAuth as ServerAuthV1 } from "@opencode-ai/server/auth"
 import { Effect, Encoding, Layer, Option, Redacted } from "effect"
 import { HttpEffect, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiError, HttpApiMiddleware } from "effect/unstable/httpapi"
@@ -21,9 +20,13 @@ const AUTH_TOKEN_QUERY = "auth_token"
 const UNAUTHORIZED = 401
 const WWW_AUTHENTICATE = 'Basic realm="Secure Area"'
 
-function base64UrlDecode(input: string): Uint8Array {
-  const base64 = input.replace(/-/g, "+").replace(/_/g, "/").padEnd(input.length + ((4 - (input.length % 4)) % 4), "=")
-  return Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+function base64UrlDecode(input: string): Uint8Array | undefined {
+  try {
+    const base64 = input.replace(/-/g, "+").replace(/_/g, "/").padEnd(input.length + ((4 - (input.length % 4)) % 4), "=")
+    return Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+  } catch {
+    return undefined
+  }
 }
 
 function decodeJwtPayload(payload: string): { info: UserContext.Info; exp?: number } {
@@ -58,8 +61,11 @@ function verifyJwt(token: string, secret: string): Effect.Effect<UserContext.Inf
       crypto.subtle.importKey("raw", textEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]),
     )
 
+    const decodedSig = base64UrlDecode(signatureB64)
+    if (!decodedSig) return yield* Effect.fail(new UnauthorizedError({ message: "Invalid JWT signature" }))
+
     const valid = yield* Effect.promise(() =>
-      crypto.subtle.verify("HMAC", key, base64UrlDecode(signatureB64) as BufferSource, textEncoder().encode(`${headerB64}.${payloadB64}`) as BufferSource),
+      crypto.subtle.verify("HMAC", key, decodedSig, textEncoder().encode(`${headerB64}.${payloadB64}`)),
     )
 
     if (!valid) return yield* Effect.fail(new UnauthorizedError({ message: "Invalid JWT signature" }))
@@ -178,8 +184,10 @@ export const authorizationLayer = Layer.effect(
   Authorization,
   Effect.gen(function* () {
     const config = yield* ServerAuth.Config
-    const jwtConfigOpt = yield* Effect.serviceOption(ServerAuthV1.JwtConfig)
-    const jwtSecret = Option.getOrUndefined(jwtConfigOpt)
+    // Read JWT secret directly from the environment instead of depending on
+    // JwtConfig.layer, which introduces a Config.ConfigError dependency that
+    // conflicts with the HttpApi middleware layer stack.
+    const jwtSecret = process.env.OPENCODE_JWT_SECRET || undefined
 
     return Authorization.of((effect) =>
       Effect.gen(function* () {

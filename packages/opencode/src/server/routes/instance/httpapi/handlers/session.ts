@@ -206,8 +206,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         Effect.mapError(() => new HttpApiError.BadRequest({})),
       )
       const location = json?.location
-      const effectiveDirectory = typeof location === "string" && location.length > 0
-        ? yield* resolveWorkspaceDirectory(location)
+      // location can be a plain string, or an object with a "directory" field
+      const locationStr = typeof location === "string" ? location
+        : (location && typeof location === "object" && "directory" in (location as Record<string, unknown>) && typeof (location as Record<string, unknown>).directory === "string"
+          ? (location as Record<string, unknown>).directory as string
+          : undefined)
+      const effectiveDirectory = locationStr && locationStr.length > 0
+        ? yield* resolveWorkspaceDirectory(locationStr)
         : yield* resolveWorkspaceDirectory(undefined)
       const payload = decoded
         ? {
