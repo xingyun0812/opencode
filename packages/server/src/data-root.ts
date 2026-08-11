@@ -2,15 +2,16 @@ export * as DataRoot from "./data-root"
 
 import { Global } from "@opencode-ai/core/global"
 import { Context, Effect, Layer } from "effect"
-import path from "path"
+
+// workspacePath is now at @opencode-ai/core/workspace-path
+// Re-export for backward compatibility.
+export { workspacePath } from "@opencode-ai/core/workspace-path"
 
 // ─── DataRootConfig ────────────────────────────────────────────
 //
 // Controls the root directory for server-managed data (workspaces, etc).
 // Defaults to @opencode-ai/core/global Path.data (which follows XDG base dir
 // convention). Can be overridden via OPENCODE_DATA_ROOT env var.
-
-const workspaceDir = (root: string) => path.join(root, "workspaces")
 
 export class DataRootConfig extends Context.Service<DataRootConfig, string>()("@opencode/DataRootConfig") {
   static get layer() {
@@ -32,20 +33,6 @@ export class DataRootConfig extends Context.Service<DataRootConfig, string>()("@
 //
 // Derives the per-user workspace path from the configured data root.
 // Used by session.create to determine the default location.directory.
-
-export function workspacePath(userID: string, dataRoot: string): string {
-  // Defense-in-depth: caller (deriveDefaultLocation) already guards against
-  // empty userID, but if someone calls this directly the result would be the
-  // workspace root with no subdirectory — multiple empty-userID callers would
-  // collide. Reject empty userID explicitly.
-  if (!userID) throw new TypeError("userID must not be empty")
-  // encodeURIComponent does NOT encode "." or "..", so path-traversal
-  // sequences like "../etc" would survive encoding. Strip them explicitly.
-  const safe = encodeURIComponent(userID).replace(/\.\.?/g, (m) =>
-    m === ".." ? "%2E%2E" : "%2E",
-  )
-  return path.join(workspaceDir(dataRoot), safe)
-}
 
 export function dataRootFromConfig(): Effect.Effect<string, never, DataRootConfig> {
   return Effect.map(DataRootConfig, (root) => root)
