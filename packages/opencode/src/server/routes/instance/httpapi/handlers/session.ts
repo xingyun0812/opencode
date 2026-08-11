@@ -48,6 +48,20 @@ const tryParseJson = (text: string) =>
     catch: () => new HttpApiError.BadRequest({}),
   })
 
+/** Extract user identity from UserContext if available */
+function userIdentityFromContext(): Effect.Effect<{ userID?: string; userDepartmentCode?: string }, never> {
+  return Effect.gen(function* () {
+    const userCtx = yield* Effect.serviceOption(UserContext.Service)
+    if (Option.isSome(userCtx)) {
+      return {
+        userID: userCtx.value.userID || undefined,
+        userDepartmentCode: userCtx.value.departmentCode || undefined,
+      }
+    }
+    return {}
+  })
+}
+
 /**
  * Resolves the workspace directory for a new session.
  * Priority:
@@ -176,11 +190,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       )
     })
 
-    const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput, directory?: string }) {
-      if (ctx.directory) {
-        return yield* session.create({ ...ctx.payload, directory: ctx.directory })
-      }
-      return yield* shareSvc.create(ctx.payload)
+    const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput; directory?: string }) {
+      const identity = yield* userIdentityFromContext()
+      return yield* shareSvc.create(ctx.payload, { ...identity, directory: ctx.directory })
     })
 
     const createRaw = Effect.fn("SessionHttpApi.createRaw")(function* (ctx: {
@@ -189,12 +201,14 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       const body = yield* Effect.orDie(ctx.request.text)
       if (body.trim().length === 0) return yield* create({})
 
-      const json = yield* tryParseJson(body)
+      const json = yield* tryParseJson(body) as Record<string, unknown> | undefined
       const decoded = yield* Schema.decodeUnknownEffect(Session.CreateInput)(json).pipe(
         Effect.mapError(() => new HttpApiError.BadRequest({})),
       )
-      const location = typeof json === "object" && json !== null ? (json as Record<string, unknown>).location as string | undefined : undefined
-      const effectiveDirectory = location && typeof location === "string" && location.length > 0 ? yield* resolveWorkspaceDirectory(location) : yield* resolveWorkspaceDirectory(undefined)
+      const location = json?.location
+      const effectiveDirectory = typeof location === "string" && location.length > 0
+        ? yield* resolveWorkspaceDirectory(location)
+        : yield* resolveWorkspaceDirectory(undefined)
       const payload = decoded
         ? {
             ...decoded,

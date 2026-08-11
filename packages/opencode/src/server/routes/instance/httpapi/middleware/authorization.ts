@@ -40,6 +40,12 @@ function decodeJwtPayload(payload: string): { info: UserContext.Info; exp?: numb
   }
 }
 
+// JWT verify using Web Crypto API instead of reusing @opencode-ai/server/auth's
+// ServerAuth.validateJwt() because that function lives in the server package and
+// depends on Effect-style route context types that V2's HttpApi middleware doesn't
+// share. Inlining the HMAC-SHA256 verification here keeps the V2 instance auth layer
+// self-contained within the opencode package, avoiding a cross-package Effect type
+// mismatch on the middleware boundary.
 function verifyJwt(token: string, secret: string): Effect.Effect<UserContext.Info, UnauthorizedError> {
   return Effect.gen(function* () {
     const parts = token.split(".")
@@ -184,18 +190,20 @@ export const authorizationLayer = Layer.effect(
         const bearerToken = extractBearerToken(request)
         if (bearerToken) {
           if (!jwtSecret) {
-            // JWT secret not configured, skip JWT validation
-          } else {
-            const result = yield* verifyJwt(bearerToken, jwtSecret).pipe(Effect.option)
-            if (Option.isSome(result)) {
-              return yield* effect.pipe(Effect.provideService(UserContext.Service, result.value))
-            }
-            // JWT present but invalid — do NOT fall back to Basic Auth
-            yield* HttpEffect.appendPreResponseHandler((_request, response) =>
-              Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", WWW_AUTHENTICATE)),
-            )
+            // JWT secret not configured — reject Bearer tokens with 401
+            // instead of silently falling back to Basic Auth, so clients
+            // get a clear signal that their token format isn't accepted.
             return yield* new HttpApiError.Unauthorized({})
           }
+          const result = yield* verifyJwt(bearerToken, jwtSecret).pipe(Effect.option)
+          if (Option.isSome(result)) {
+            return yield* effect.pipe(Effect.provideService(UserContext.Service, result.value))
+          }
+          // JWT present but invalid — do NOT fall back to Basic Auth
+          yield* HttpEffect.appendPreResponseHandler((_request, response) =>
+            Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", WWW_AUTHENTICATE)),
+          )
+          return yield* new HttpApiError.Unauthorized({})
         }
 
         // Fall back to Basic Auth

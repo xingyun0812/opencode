@@ -7,17 +7,17 @@ const workspaceDir = (root: string) => path.join(root, "workspaces")
 /**
  * Derives the per-user workspace path from the configured data root.
  *
- * The userID is sanitized via encodeURIComponent plus explicit `.` / `..`
- * stripping, then appended to `<dataRoot>/workspaces/`.
+ * The userID is sanitized via encodeURIComponent with explicit `.` / `..`
+ * stripping before encoding, then appended to `<dataRoot>/workspaces/`.
  *
  * @throws {TypeError} if userID is empty
  */
 export function workspacePath(userID: string, dataRoot: string): string {
   if (!userID) throw new TypeError("userID must not be empty")
-  // encodeURIComponent does NOT encode "." or "..", so path-traversal
-  // sequences like "../etc" would survive encoding. Strip them explicitly.
-  const safe = encodeURIComponent(userID).replace(/\.\.?/g, (m) =>
-    m === ".." ? "%2E%2E" : "%2E",
-  )
+  // Strip dots before encoding: encodeURIComponent leaves "." and ".."
+  // unencoded, and path.join would resolve ".." as parent-directory
+  // traversal. Removing dots pre-encoding also prevents a hypothetical
+  // downstream URL-decode from re-exposing traversal sequences.
+  const safe = encodeURIComponent(userID.replaceAll("..", "").replaceAll(".", ""))
   return path.join(workspaceDir(dataRoot), safe)
 }

@@ -38,7 +38,6 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
-import { UserContext } from "@opencode-ai/schema/user-context"
 import { Effect, Layer, Option, Context, Schema, Types } from "effect"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -686,13 +685,12 @@ const layer: Layer.Layer<
       permission?: PermissionV1.Ruleset
       workspaceID?: WorkspaceV2.ID
       directory?: string
+      userID?: string
+      userDepartmentCode?: string
     }) {
       const ctx = yield* InstanceState.context
       const workspace = yield* InstanceState.workspaceID
       const effectiveDirectory = input?.directory ?? ctx.directory
-      const userCtx = yield* Effect.serviceOption(UserContext.Service)
-      const userID = Option.isSome(userCtx) ? userCtx.value.userID : undefined
-      const departmentCode = Option.isSome(userCtx) ? userCtx.value.departmentCode : undefined
       return yield* createNext({
         parentID: input?.parentID,
         directory: effectiveDirectory,
@@ -703,8 +701,8 @@ const layer: Layer.Layer<
         metadata: input?.metadata,
         permission: input?.permission,
         workspaceID: input?.workspaceID ?? workspace,
-        userID,
-        userDepartmentCode: departmentCode,
+        userID: input?.userID,
+        userDepartmentCode: input?.userDepartmentCode,
       })
     })
 
