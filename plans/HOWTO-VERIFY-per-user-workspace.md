@@ -48,20 +48,30 @@ cd packages/server && bun test
 
 ### 2.1 JWT 用户 → workspace 目录
 
-```bash
-# 生成 JWT Token
-JWT_SECRET="test-secret"
-JWT_HEADER=$(echo -n '{"alg":"HS256","typ":"JWT"}' | base64 | tr -d '=' | tr '/+' '_-')
-JWT_PAYLOAD=$(echo -n '{"user_id":"user-abc-123","username":"testuser","department_code":"eng","role":"user","permissions":[]}' | base64 | tr -d '=' | tr '/+' '_-')
-JWT_SIG=$(echo -n "$JWT_HEADER.$JWT_PAYLOAD" | openssl dgst -sha256 -hmac "$JWT_SECRET" -binary | base64 | tr -d '=' | tr '/+' '_-')
-TOKEN="$JWT_HEADER.$JWT_PAYLOAD.$JWT_SIG"
+> **注意**: 实现使用 Web Crypto API (`crypto.subtle.verify`) 验证 JWT 签名，和 `openssl dgst -hmac` 生成的签名不兼容。请使用 `gen-token.mjs` 脚本生成测试 token。
 
-# 创建 session（不传 location）
+```bash
+# 使用 Bun 生成 JWT Token（与 server 的 Web Crypto API 一致）
+cat > /tmp/gen-token.mjs << 'SCRIPT'
+const JWT_SECRET = "test-secret"
+const payload = { user_id: "user-abc-123", username: "testuser", department_code: "eng", role: "user", permissions: [] }
+const b64url = (s) => Buffer.from(s).toString("base64").replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_")
+const enc = new TextEncoder()
+const key = await crypto.subtle.importKey("raw", enc.encode(JWT_SECRET), {name:"HMAC",hash:"SHA-256"}, false, ["sign"])
+const h = b64url(JSON.stringify({alg:"HS256",typ:"JWT"}))
+const p = b64url(JSON.stringify(payload))
+const s = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(h+"."+p)))
+console.log(h+"."+p+"."+Buffer.from(s).toString("base64").replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_"))
+SCRIPT
+TOKEN=$(bun run /tmp/gen-token.mjs 2>/dev/null)
+echo "Token: $TOKEN"
+
+# 创建 session（V2 API endpoint: /session）
 curl -s -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name":"test-session"}' \
-  http://localhost:3080/api/sessions | jq '.directory'
+  -d '{"title":"test-session"}' \
+  http://localhost:3080/session | jq '.directory'
 
 # 期望: 目录为 <OPENCODE_DATA_ROOT>/workspaces/user-abc-123/
 ```
@@ -76,18 +86,18 @@ curl -s -X POST \
     "name": "explicit-session",
     "location": {"directory": "/tmp/my-project"}
   }' \
-  http://localhost:3080/api/sessions | jq '.directory'
+  http://localhost:3080/session | jq '.directory'
 
 # 期望: /tmp/my-project（忽略 workspace 默认）
 ```
 
-### 2.3 无 JWT（Basic Auth）→ process.cwd()
+### 2.3 无认证 → process.cwd()
 
 ```bash
 curl -s -X POST \
   -H "Content-Type: application/json" \
   -d '{"name":"legacy-session"}' \
-  http://localhost:3080/api/sessions | jq '.directory'
+  http://localhost:3080/session | jq '.directory'
 
 # 期望: server 的 process.cwd()（即项目根目录）
 ```
@@ -102,7 +112,7 @@ curl -s -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"session-after-delete"}' \
-  http://localhost:3080/api/sessions | jq '.directory'
+  http://localhost:3080/session | jq '.directory'
 
 ls -la /tmp/opencode-test/workspaces/user-abc-123/
 # 期望: 目录已存在
@@ -110,24 +120,34 @@ ls -la /tmp/opencode-test/workspaces/user-abc-123/
 
 ### 2.5 userID 路径穿越防护
 
+> 生成 JWT 需要与 server 的 Web Crypto API 兼容。使用 `gen-token.mjs` 生成恶意 userID 的 token：
+
 ```bash
-# 生成带有恶意 userID 的 JWT
-JWT_PAYLOAD_EVIL=$(echo -n '{"user_id":"../etc/passwd","username":"evil","role":"user","permissions":[]}' | base64 | tr -d '=' | tr '/+' '_-')
-JWT_SIG_EVIL=$(echo -n "$JWT_HEADER.$JWT_PAYLOAD_EVIL" | openssl dgst -sha256 -hmac "$JWT_SECRET" -binary | base64 | tr -d '=' | tr '/+' '_-')
-TOKEN_EVIL="$JWT_HEADER.$JWT_PAYLOAD_EVIL.$JWT_SIG_EVIL"
+cat > /tmp/gen-evil-token.mjs << 'SCRIPT'
+const JWT_SECRET = "test-secret"
+const payload = { user_id: "../etc/passwd", username: "evil", role: "user", permissions: [] }
+const b64url = (s) => Buffer.from(s).toString("base64").replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_")
+const enc = new TextEncoder()
+const key = await crypto.subtle.importKey("raw", enc.encode(JWT_SECRET), {name:"HMAC",hash:"SHA-256"}, false, ["sign"])
+const h = b64url(JSON.stringify({alg:"HS256",typ:"JWT"}))
+const p = b64url(JSON.stringify(payload))
+const s = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(h+"."+p)))
+console.log(h+"."+p+"."+Buffer.from(s).toString("base64").replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_"))
+SCRIPT
+EVIL_TOKEN=$(bun run /tmp/gen-evil-token.mjs 2>/dev/null)
+echo "Token: $EVIL_TOKEN"
 
 # 创建 session
 curl -s -X POST \
-  -H "Authorization: Bearer $TOKEN_EVIL" \
+  -H "Authorization: Bearer $EVIL_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"evil-session"}' \
-  http://localhost:3080/api/sessions | jq '.directory'
+  http://localhost:3080/session | jq '.directory'
 
-# 期望: 目录应为 encodeURIComponent 后的安全路径，不是 /etc/passwd
-# encodeURIComponent("../etc/passwd") = "%2E%2E%2Fetc%2Fpasswd"
+# 期望: 目录应为 encodeURIComponent 后的安全路径（%2E%2E%2Fetc%2Fpasswd 被剥离），不是 /etc/passwd
 ```
 
-### 2.6 目录创建失败 → 500（注释标明了后续应改 503）
+### 2.6 目录创建失败 → 500
 
 ```bash
 # 将 workspace 目录设为只读后创建 session
@@ -137,7 +157,7 @@ curl -s -o /dev/null -w "%{http_code}" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"readonly-session"}' \
-  http://localhost:3080/api/sessions
+  http://localhost:3080/session
 
 # 期望: 500（当前实现使用 Effect.orDie）
 chmod 755 /tmp/opencode-test/workspaces
@@ -145,20 +165,22 @@ chmod 755 /tmp/opencode-test/workspaces
 
 ### 2.7 session 之间的隔离
 
+> V2 API 返回的 session ID 字段为 `id` 而非 `sessionID`。
+
 ```bash
-USER_A_TOKEN=...  # user-a 的 JWT
+USER_A_TOKEN=...  # user-a 的 JWT，参考 2.1 生成
 USER_B_TOKEN=...  # user-b 的 JWT
 
 # user-a 创建 session
 SESS_A=$(curl -s -X POST -H "Authorization: Bearer $USER_A_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"session-a"}' \
-  http://localhost:3080/api/sessions | jq -r '.sessionID')
+  http://localhost:3080/session | jq -r '.id')
 
 # user-b 试图访问 user-a 的 session
 curl -s -o /dev/null -w "%{http_code}" \
   -H "Authorization: Bearer $USER_B_TOKEN" \
-  http://localhost:3080/api/sessions/$SESS_A
+  http://localhost:3080/session/$SESS_A
 
 # 期望: 404（看不到别人的 session）
 ```
@@ -185,78 +207,101 @@ cd packages/server && bun test
 
 ## 快速验证脚本
 
-保存为 `verify-workspace-directories.sh`：
+保存为 `verify-workspace-directories.mjs`（需要 Bun 运行，因为实现使用 Web Crypto API 签名 JWT）：
 
 ```bash
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bun
+import { execSync, spawn } from "child_process"
+import { existsSync, mkdirSync, rmSync } from "fs"
 
-SERVER="http://localhost:3080"
-JWT_SECRET="test-secret"
-DATA_ROOT="/tmp/opencode-test-verify"
+const JWT_SECRET = "test-secret"
+const DATA_ROOT = "/tmp/opencode-test-verify"
+const SERVER = "http://localhost:3080"
 
-b64url() { echo -n "$1" | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n'; }
-
-gen_token() {
-  local header=$(b64url '{"alg":"HS256","typ":"JWT"}')
-  local payload=$(b64url "$1")
-  local sig=$(echo -n "$header.$payload" | openssl dgst -sha256 -hmac "$JWT_SECRET" -binary | base64 | tr -d '=' | tr '/+' '_-')
-  echo "$header.$payload.$sig"
+function b64url(str: string): string {
+  return Buffer.from(str).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_")
 }
 
-USER_TOKEN=$(gen_token '{"user_id":"user1","username":"u1","role":"user","permissions":[]}')
+async function genToken(payload: object): Promise<string> {
+  const headerB64 = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }))
+  const payloadB64 = b64url(JSON.stringify(payload))
+  const encoder = new TextEncoder()
+  const key = await crypto.subtle.importKey(
+    "raw", encoder.encode(JWT_SECRET),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+  )
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(`${headerB64}.${payloadB64}`)))
+  const sigB64 = Buffer.from(sig).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_")
+  return `${headerB64}.${payloadB64}.${sigB64}`
+}
 
-cleanup() { rm -rf "$DATA_ROOT"; kill %1 2>/dev/null; }
+async function post(path: string, token?: string, body?: object) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" }
+  if (token) headers["Authorization"] = `Bearer ${token}`
+  const resp = await fetch(`${SERVER}${path}`, {
+    method: "POST", headers,
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  const data = resp.headers.get("content-type")?.includes("json") ? await resp.json() : null
+  return { status: resp.status, data }
+}
 
-# 启动 server
-OPENCODE_DATA_ROOT="$DATA_ROOT" \
-  OPENCODE_JWT_SECRET="$JWT_SECRET" \
-  OPENCODE_SERVER_PASSWORD="test" \
-  bun run dev serve --port 3080 &
+const check = (name: string, ok: boolean) => console.log(ok ? `  PASS: ${name}` : `  FAIL: ${name}`)
+
+async function main() {
+  const USER_TOKEN = await genToken({ user_id: "user1", username: "u1", role: "user", permissions: [] })
+  const EVIL_TOKEN = await genToken({ user_id: "../etc", username: "evil", role: "user", permissions: [] })
+
+  // Test 1: JWT → workspace 目录
+  console.log("=== Test 1: JWT session uses workspace dir ===")
+  let r = await post("/session", USER_TOKEN, { title: "t1" })
+  check("status 200", r.status === 200)
+  check(`dir is ${DATA_ROOT}/workspaces/user1`, r.data?.directory === `${DATA_ROOT}/workspaces/user1`)
+  const DIR = r.data?.directory
+
+  // Test 2: 目录自动创建
+  console.log("=== Test 2: Directory auto-created ===")
+  check("directory exists", DIR && existsSync(DIR))
+
+  // Test 3: 显式 location 覆盖
+  console.log("=== Test 3: Explicit location ===")
+  r = await post("/session", USER_TOKEN, { title: "t2", location: { directory: "/tmp/custom" } })
+  check("dir is /tmp/custom", r.data?.directory === "/tmp/custom")
+
+  // Test 4: 无认证 → cwd
+  console.log("=== Test 4: No auth uses cwd ===")
+  r = await post("/session", undefined, { title: "t3" })
+  check("status 200", r.status === 200)
+  check('dir contains "opencode"', r.data?.directory?.includes("opencode"))
+
+  // Test 5: 路径穿越防护
+  console.log("=== Test 5: Path traversal sanitization ===")
+  r = await post("/session", EVIL_TOKEN, { title: "t4" })
+  check("status 200", r.status === 200)
+  check("dir not in /etc", r.data?.directory && !r.data.directory.includes("/etc"))
+
+  console.log("\n=== ALL DONE ===")
+}
+
+await main().catch((e) => { console.error(e); process.exit(1) })
+```
+
+运行方式：
+
+```bash
+# 1. 启动 server
+OPENCODE_DATA_ROOT=/tmp/opencode-test-verify OPENCODE_JWT_SECRET=test-secret bun run dev serve --port 3080 &
 sleep 3
 
-# Test 1: JWT → workspace 目录
-echo "=== Test 1: JWT session uses workspace dir ==="
-DIR=$(curl -s -X POST -H "Authorization: Bearer $USER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"t1"}' "$SERVER/api/sessions" | jq -r '.directory')
-[[ "$DIR" == "$DATA_ROOT/workspaces/user1" ]] && echo "PASS: $DIR" || echo "FAIL: $DIR"
+# 2. 运行验证脚本
+bun run /path/to/verify-workspace-directories.mjs
 
-# Test 2: 目录自动创建
-echo "=== Test 2: Directory auto-created ==="
-ls -d "$DIR" >/dev/null 2>&1 && echo "PASS: directory exists" || echo "FAIL"
-
-# Test 3: 显式 location 覆盖
-echo "=== Test 3: Explicit location ==="
-DIR2=$(curl -s -X POST -H "Authorization: Bearer $USER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"t2","location":{"directory":"/tmp/custom"}}' \
-  "$SERVER/api/sessions" | jq -r '.directory')
-[[ "$DIR2" == "/tmp/custom" ]] && echo "PASS: $DIR2" || echo "FAIL: $DIR2"
-
-# Test 4: Basic Auth → cwd
-echo "=== Test 4: Basic Auth uses cwd ==="
-DIR3=$(curl -s -X POST -H "Authorization: Basic $(echo -n 'opencode:test' | base64)" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"t3"}' "$SERVER/api/sessions" | jq -r '.directory')
-[[ "$DIR3" == *"opencode"* ]] && echo "PASS: $DIR3" || echo "FAIL: $DIR3"
-
-# Test 5: 路径穿越防护
-echo "=== Test 5: Path traversal sanitization ==="
-EVIL_TOKEN=$(gen_token '{"user_id":"../etc","username":"evil","role":"user","permissions":[]}')
-DIR4=$(curl -s -X POST -H "Authorization: Bearer $EVIL_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"t4"}' "$SERVER/api/sessions" | jq -r '.directory')
-[[ "$DIR4" != *"/etc"* ]] && echo "PASS: sanitized" || echo "FAIL: $DIR4"
-
-echo "=== DONE ==="
-cleanup
-```
+# 3. 清理
+kill %1 2>/dev/null; rm -rf /tmp/opencode-test-verify
 
 ---
 
 ## 已知限制
 
 1. **目录创建失败返回 500 而非 503** — 因为 protocol endpoint 未声明 ServiceUnavailableError，当前用 `Effect.orDie` 转为 defect。注释已说明，后续可改。
-2. **仅覆盖 V1 routes** — `deriveDefaultLocation` 只在 `packages/server` 的 V1 handler 中实现。V2 route (`@opencode-ai/opencode`) 的 session create 不经过这个逻辑。
-3. **WorkspaceCleanup 接口定义但无实现** — 只有 Effect type + Service tag，清理逻辑需后续实现。
+2. **WorkspaceCleanup 接口定义但无实现** — 只有 Effect type + Service tag，清理逻辑需后续实现。

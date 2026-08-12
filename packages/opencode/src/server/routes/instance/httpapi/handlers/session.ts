@@ -21,6 +21,7 @@ import * as Stream from "effect/Stream"
 import { InstanceState } from "@/effect/instance-state"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError, HttpApiSchema } from "effect/unstable/httpapi"
+import * as fs from "fs"
 import { InstanceHttpApi } from "../api"
 import {
   CommandPayload,
@@ -220,6 +221,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
             permission: decoded.permission ? [...decoded.permission] : undefined,
           }
         : decoded
+      // Create workspace directory if it doesn't exist
+      if (effectiveDirectory) {
+        yield* Effect.sync(() => fs.mkdirSync(effectiveDirectory, { recursive: true })).pipe(Effect.orDie)
+      }
       return yield* create({ payload, directory: effectiveDirectory })
     })
 
