@@ -184,6 +184,8 @@ export default {
           \`project_id\` text NOT NULL,
           \`workspace_id\` text,
           \`parent_id\` text,
+          \`user_id\` text,
+          \`user_department_code\` text,
           \`slug\` text NOT NULL,
           \`directory\` text NOT NULL,
           \`path\` text,
