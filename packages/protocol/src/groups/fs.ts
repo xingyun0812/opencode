@@ -17,6 +17,12 @@ const FindQuery = Schema.Struct({
   limit: Schema.NumberFromString.pipe(Schema.decodeTo(PositiveInt), Schema.optional),
 })
 
+export interface UploadedFile extends Schema.Schema.Type<typeof UploadedFile> {}
+export const UploadedFile = Schema.Struct({
+  name: Schema.String,
+  path: Schema.String,
+}).annotate({ identifier: "UploadedFile" })
+
 export const FileSystemGroup = HttpApiGroup.make("server.fs")
   .add(
     HttpApiEndpoint.get("fs.read", "/api/fs/read/*", {
@@ -60,9 +66,46 @@ export const FileSystemGroup = HttpApiGroup.make("server.fs")
         }),
       ),
   )
+  .add(
+    HttpApiEndpoint.post("fs.upload", "/api/fs/upload", {
+      success: Schema.Struct({ data: UploadedFile }),
+    }).annotateMerge(
+      OpenApi.annotations({
+        identifier: "v2.fs.upload",
+        summary: "Upload file",
+        description:
+          "Upload a file via multipart/form-data to the authenticated user's uploads directory. Returns the relative path of the stored file.",
+      }),
+    ),
+  )
+  .add(
+    HttpApiEndpoint.get("fs.uploaded", "/api/fs/uploaded", {
+      query: LocationQuery,
+      success: Location.response(Schema.Array(UploadedFile)),
+    })
+      .annotateMerge(locationQueryOpenApi)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.fs.uploaded",
+          summary: "List uploaded files",
+          description: "List the authenticated user's uploaded files (including versioned names).",
+        }),
+      ),
+  )
+  .add(
+    HttpApiEndpoint.delete("fs.uploadRemove", "/api/fs/upload/*", {
+      success: HttpApiSchema.NoContent,
+    }).annotateMerge(
+      OpenApi.annotations({
+        identifier: "v2.fs.uploadRemove",
+        summary: "Delete uploaded file",
+        description: "Delete one of the authenticated user's uploaded files.",
+      }),
+    ),
+  )
   .annotateMerge(
     OpenApi.annotations({
       title: "filesystem",
-      description: "Experimental location-scoped filesystem routes.",
+      description: "Location-scoped filesystem routes including upload.",
     }),
   )
