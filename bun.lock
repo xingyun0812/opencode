@@ -785,6 +785,7 @@
       "dependencies": {
         "@opencode-ai/core": "workspace:*",
         "@opencode-ai/protocol": "workspace:*",
+        "@opencode-ai/schema": "workspace:*",
         "drizzle-orm": "catalog:",
         "effect": "catalog:",
       },

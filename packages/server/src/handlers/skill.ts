@@ -75,7 +75,7 @@ export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers)
         Effect.fn(function* (ctx) {
           const userContext = Option.getOrUndefined(yield* UserContext.Service.pipe(Effect.option))
 
-          const all = yield* SkillV2.Service.use((skill) => skill.list())
+          const all = yield* SkillV2.Service.use((skill) => skill.list(userContext))
           const existing = all.find((s) => s.name === ctx.params.name)
           if (!existing) {
             return yield* Effect.fail(new SkillNotFoundError({
@@ -106,7 +106,7 @@ export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers)
         Effect.fn(function* (ctx) {
           const userContext = Option.getOrUndefined(yield* UserContext.Service.pipe(Effect.option))
 
-          const all = yield* SkillV2.Service.use((skill) => skill.list())
+          const all = yield* SkillV2.Service.use((skill) => skill.list(userContext))
           const existing = all.find((s) => s.name === ctx.params.name)
           if (!existing) {
             return yield* Effect.fail(new SkillNotFoundError({
