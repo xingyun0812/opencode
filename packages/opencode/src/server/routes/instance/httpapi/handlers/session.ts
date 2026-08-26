@@ -37,7 +37,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { PermissionNotFoundError, ServiceUnavailableError } from "../errors"
 import * as SessionError from "./session-errors"
 import { UserContext } from "@opencode-ai/schema/user-context"
 import { DataRootConfig } from "@opencode-ai/server/data-root"
@@ -221,9 +221,19 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
             permission: decoded.permission ? [...decoded.permission] : undefined,
           }
         : decoded
-      // Create workspace directory if it doesn't exist
+      // Create workspace directory if it doesn't exist. Failure to create
+      // the per-user workspace is a transient infrastructure condition
+      // (e.g. unwritable data root), not a defect — map it to a typed
+      // ServiceUnavailableError (HTTP 503) rather than dying into a 500.
       if (effectiveDirectory) {
-        yield* Effect.sync(() => fs.mkdirSync(effectiveDirectory, { recursive: true })).pipe(Effect.orDie)
+        yield* Effect.try({
+          try: () => fs.mkdirSync(effectiveDirectory, { recursive: true }),
+          catch: () =>
+            new ServiceUnavailableError({
+              message: `Failed to create workspace directory: ${effectiveDirectory}`,
+              service: "session.create",
+            }),
+        })
       }
       return yield* create({ payload, directory: effectiveDirectory })
     })

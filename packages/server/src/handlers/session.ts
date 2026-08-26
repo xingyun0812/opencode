@@ -29,9 +29,13 @@ const DefaultSessionHistoryLimit = 50
 //   2. JWT-authenticated user → <data_root>/workspaces/<safe_userID>/
 //   3. Basic Auth / no auth → process.cwd() (legacy, migration compatibility)
 
-function deriveDefaultLocation(
+export function deriveDefaultLocation(
   userContext: UserContext.Info | undefined,
-): Effect.Effect<{ directory: string }, never, DataRoot.DataRootConfig | FSUtil.Service> {
+): Effect.Effect<
+  { directory: string },
+  ServiceUnavailableError,
+  DataRoot.DataRootConfig | FSUtil.Service
+> {
   return Effect.gen(function* () {
     if (!userContext) {
       return { directory: process.cwd() }
@@ -40,11 +44,20 @@ function deriveDefaultLocation(
     const dataRoot = yield* DataRoot.DataRootConfig
     const dir = DataRoot.workspacePath(userContext.userID, dataRoot)
 
-    // Ensure the directory exists (mkdir -p semantics).
-    // On failure, die — the Effect runtime turns this into a 500.
-    // Once the protocol endpoint declares a ServiceUnavailableError this
-    // can become a proper 503 failure.
-    yield* FSUtil.Service.pipe(Effect.flatMap((fs) => fs.ensureDir(dir)), Effect.orDie)
+    // Ensure the directory exists (mkdir -p semantics). A failure to create
+    // the workspace is a transient infrastructure condition, not a defect —
+    // map it to a typed ServiceUnavailableError (HTTP 503) rather than
+    // dying (which the runtime would turn into a 500).
+    yield* FSUtil.Service.pipe(
+      Effect.flatMap((fs) => fs.ensureDir(dir)),
+      Effect.mapError(
+        (error) =>
+          new ServiceUnavailableError({
+            message: `Failed to create workspace directory: ${dir}`,
+            service: "session.create",
+          }),
+      ),
+    )
 
     return { directory: dir }
   })
