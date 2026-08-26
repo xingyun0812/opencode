@@ -76,6 +76,20 @@ const ListAllInput = Schema.Struct(ListInputBase)
 export const ListInput = Schema.Union([ListDirectoryInput, ListProjectInput, ListAllInput])
 export type ListInput = typeof ListInput.Type
 
+/**
+ * Ownership scoping pushed into the list SQL so pagination composes with
+ * access control: the DB returns only sessions the caller may see, so the
+ * anchor/limit operate on the accessible set rather than the full catalog.
+ * Mirrors the server handler's `canAccess` semantics:
+ *   - undefined / global_admin => no filter (see all)
+ *   - user                  => only sessions owned by the caller
+ *   - dept_admin            => sessions owned by the caller OR their department
+ */
+export type ListOwnership =
+  | { role: "user"; userID: string }
+  | { role: "dept_admin"; userID: string; departmentCode?: string }
+  | { role: "global_admin" }
+
 type CreateInput = {
   id?: SessionSchema.ID
   agent?: AgentV2.ID
@@ -113,7 +127,7 @@ export type MessageNotFoundError = SessionRevert.MessageNotFoundError
 export type Error = NotFoundError | MessageDecodeError | OperationUnavailableError | PromptConflictError
 
 export interface Interface {
-  readonly list: (input?: ListInput) => Effect.Effect<SessionSchema.Info[]>
+  readonly list: (input?: ListInput, ownership?: ListOwnership) => Effect.Effect<SessionSchema.Info[]>
   readonly create: (input: CreateInput) => Effect.Effect<SessionSchema.Info>
   readonly get: (sessionID: SessionSchema.ID) => Effect.Effect<SessionSchema.Info, NotFoundError>
   readonly messages: (input: {
@@ -281,7 +295,7 @@ const layer = Layer.effect(
         if (!session) return yield* new NotFoundError({ sessionID })
         return session
       }),
-      list: Effect.fn("V2Session.list")(function* (input = {}) {
+      list: Effect.fn("V2Session.list")(function* (input = {}, ownership?) {
         const direction = input.anchor?.direction ?? "next"
         const requestedOrder = input.order ?? "desc"
         const order = direction === "previous" ? (requestedOrder === "asc" ? "desc" : "asc") : requestedOrder
@@ -291,6 +305,21 @@ const layer = Layer.effect(
         if (input.workspaceID) conditions.push(eq(SessionTable.workspace_id, input.workspaceID))
         if ("project" in input) conditions.push(eq(SessionTable.project_id, input.project))
         if (input.search) conditions.push(like(SessionTable.title, `%${input.search}%`))
+        if (ownership) {
+          if (ownership.role === "user") {
+            conditions.push(eq(SessionTable.user_id, ownership.userID))
+          } else if (ownership.role === "dept_admin") {
+            conditions.push(
+              ownership.departmentCode
+                ? or(
+                    eq(SessionTable.user_id, ownership.userID),
+                    eq(SessionTable.user_department_code, ownership.departmentCode),
+                  )!
+                : eq(SessionTable.user_id, ownership.userID),
+            )
+          }
+          // global_admin: no filter
+        }
         if (input.anchor) {
           conditions.push(
             order === "asc"

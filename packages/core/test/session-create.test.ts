@@ -422,4 +422,43 @@ describe("SessionV2.create", () => {
       ).toBe("Session.NotFoundError")
     }),
   )
+
+  it.effect("list narrows a user to sessions owned by that user", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionV2.Service
+      const mine = yield* session.create({ location, userID: "user-a" })
+      const others = yield* session.create({ location, userID: "user-b" })
+
+      expect(yield* session.list(undefined, { role: "user", userID: "user-a" }).pipe(Effect.map((s) => s.map((x) => x.id)))).toEqual(
+        [mine.id],
+      )
+      expect(others.id).not.toBe(mine.id)
+    }),
+  )
+
+  it.effect("list lets a department admin see their own and same-department sessions", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionV2.Service
+      const admin = yield* session.create({ location, userID: "admin-a", userDepartmentCode: "eng" })
+      const peer = yield* session.create({ location, userID: "eng-peer", userDepartmentCode: "eng" })
+      const other = yield* session.create({ location, userID: "design-peer", userDepartmentCode: "design" })
+
+      expect(
+        yield* session
+          .list(undefined, { role: "dept_admin", userID: "admin-a", departmentCode: "eng" })
+          .pipe(Effect.map((s) => new Set(s.map((x) => x.id)))),
+      ).toEqual(new Set([admin.id, peer.id]))
+      expect(other.id).not.toBe(admin.id)
+    }),
+  )
+
+  it.effect("list ignores ownership for global administrators", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionV2.Service
+      yield* session.create({ location, userID: "user-a" })
+      yield* session.create({ location, userID: "user-b" })
+
+      expect(yield* session.list(undefined, { role: "global_admin" })).toHaveLength(2)
+    }),
+  )
 })

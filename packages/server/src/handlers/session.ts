@@ -117,13 +117,28 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                   Effect.mapError(() => new InvalidCursorError({ message: "Invalid cursor" })),
                 )
               : ctx.query
-          const sessions = yield* session.list({
-            ...query,
-            workspaceID: query.workspace,
-            limit: ctx.query.limit ?? DefaultSessionsLimit,
-          })
 
-          // Filter sessions by access
+          // Derive the ownership filter (undefined => see all) from the caller's
+          // role so pagination composes with access control in the SQL query.
+          const ownership =
+            !userContext || userContext.role === "global_admin"
+              ? undefined
+              : userContext.role === "dept_admin"
+                ? { role: "dept_admin" as const, userID: userContext.userID, departmentCode: userContext.departmentCode }
+                : { role: "user" as const, userID: userContext.userID }
+
+          const sessions = yield* session.list(
+            {
+              ...query,
+              workspaceID: query.workspace,
+              limit: ctx.query.limit ?? DefaultSessionsLimit,
+            },
+            ownership,
+          )
+
+          // Filter sessions by access (defense-in-depth; the SQL query already
+          // narrowed to an accessible set, so this is a no-op for authenticated
+          // callers).
           const filtered = userContext
             ? sessions.filter((s) => canAccess(userContext, s))
             : sessions
