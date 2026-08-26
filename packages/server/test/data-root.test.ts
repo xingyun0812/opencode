@@ -7,6 +7,12 @@ import os from "os"
 // local replica, so the tests stay in sync with the shipped implementation.
 const { workspacePath: actualWorkspacePath } = await import("@opencode-ai/server/data-root")
 
+import { DataRoot } from "@opencode-ai/server/data-root"
+import { deriveDefaultLocation } from "@opencode-ai/server/handlers/session"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { UserContext } from "@opencode-ai/schema/user-context"
+import { Effect } from "effect"
+
 // encodeURIComponent leaves ".", "@", "-", "_", "!", "~", "*", "(", ")"
 // unencoded. The sanitizer additionally neutralizes literal dots to "%2E"
 // and every separator ("/", "\\") to its percent-encoding, so no traversal
@@ -138,22 +144,33 @@ describe("DataRootConfig", () => {
 // create the per-user workspace is a transient infrastructure condition the
 // PRD maps to HTTP 503 (ServiceUnavailableError), NOT a defect (500).
 
-const { ServiceUnavailableError } = await import("@opencode-ai/protocol/errors")
-const { Effect } = await import("effect")
-const { deriveDefaultLocation } = await import("@opencode-ai/server/handlers/session")
-const { DataRoot } = await import("@opencode-ai/server/data-root")
-const { FSUtil } = await import("@opencode-ai/core/fs-util")
+import { ServiceUnavailableError } from "@opencode-ai/protocol/errors"
 
-/** An FSUtil.Service stub exposing a controllable ensureDir. */
-const fakeFSUtil = (ensureDir: () => Effect.Effect<void>) =>
-  ({ ensureDir }) as unknown as FSUtil.Service
+/** A full UserContext.Info shaped for a plain user in tests. */
+const userCtx = (userID: string): UserContext.Info => ({
+  userID,
+  username: userID,
+  role: "user",
+  permissions: [],
+})
+
+/** An FSUtil.Service stub exposing a controllable ensureDir (matches the interface's (path) => Effect<void, Error>). */
+const fakeFSUtil = (ensureDir: (path: string) => Effect.Effect<void, Error>) =>
+  ({ ensureDir }) as unknown as FSUtil.Interface
+
+/** Run an effect after providing the DataRootConfig + FSUtil services required by deriveDefaultLocation. */
+const runWithServices = <A, E>(program: Effect.Effect<A, E, DataRoot.DataRootConfig | FSUtil.Service>) =>
+  Effect.provideService(
+    Effect.provideService(program, DataRoot.DataRootConfig, "/data"),
+    FSUtil.Service,
+    fakeFSUtil(() => Effect.void),
+  ).pipe(Effect.runPromise) as Promise<A>
 
 describe("deriveDefaultLocation mkdir failure", () => {
   test("mkdir failure maps to ServiceUnavailableError (503), not a defect", async () => {
-    const userContext = { userID: "user-1", role: "user" as const }
     const program = Effect.provideService(
       Effect.provideService(
-        deriveDefaultLocation(userContext).pipe(Effect.flip),
+        deriveDefaultLocation(userCtx("user-1")).pipe(Effect.flip),
         DataRoot.DataRootConfig,
         "/data",
       ),
@@ -166,27 +183,17 @@ describe("deriveDefaultLocation mkdir failure", () => {
   })
 
   test("no UserContext keeps process.cwd() default and skips mkdir", async () => {
-    const dir = await deriveDefaultLocation(undefined).pipe(Effect.runPromise)
+    const dir = await runWithServices(deriveDefaultLocation(undefined))
     expect(dir.directory).toBe(process.cwd())
   })
 
   test("UserContext defaults to <data_root>/workspaces/<safe_userID>", async () => {
-    const userContext = { userID: "user-1", role: "user" as const }
-    const dir = await Effect.provideService(
-      Effect.provideService(deriveDefaultLocation(userContext), DataRoot.DataRootConfig, "/data"),
-      FSUtil.Service,
-      fakeFSUtil(() => Effect.void),
-    ).pipe(Effect.runPromise)
+    const dir = await runWithServices(deriveDefaultLocation(userCtx("user-1")))
     expect(dir.directory).toBe("/data/workspaces/user-1")
   })
 
   test("UserContext with weird userID still yields a rooted, distinct dir", async () => {
-    const userContext = { userID: "user.name", role: "user" as const }
-    const dir = await Effect.provideService(
-      Effect.provideService(deriveDefaultLocation(userContext), DataRoot.DataRootConfig, "/data"),
-      FSUtil.Service,
-      fakeFSUtil(() => Effect.void),
-    ).pipe(Effect.runPromise)
+    const dir = await runWithServices(deriveDefaultLocation(userCtx("user.name")))
     expect(dir.directory).toBe("/data/workspaces/user%2Ename")
     expect(dir.directory.startsWith("/data/workspaces/")).toBe(true)
   })
