@@ -38,3 +38,9 @@ export class FindInput extends Schema.Class<FindInput>("FileSystem.FindInput")({
   type: Schema.Literals(["file", "directory"]).pipe(optional),
   limit: PositiveInt.pipe(optional),
 }) {}
+
+export interface UploadEntry extends Schema.Schema.Type<typeof UploadEntry> {}
+export const UploadEntry = Schema.Struct({
+  name: Schema.String,
+  path: Schema.String,
+}).annotate({ identifier: "FileSystem.UploadEntry" })

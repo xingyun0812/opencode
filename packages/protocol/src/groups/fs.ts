@@ -60,9 +60,45 @@ export const FileSystemGroup = HttpApiGroup.make("server.fs")
         }),
       ),
   )
-  .annotateMerge(
-    OpenApi.annotations({
-      title: "filesystem",
-      description: "Experimental location-scoped filesystem routes.",
-    }),
+  .add(
+    HttpApiEndpoint.post("fs.upload", "/api/fs/upload", {
+      query: LocationQuery,
+      success: Schema.Struct({ data: Schema.Struct({ path: Schema.String, name: Schema.String }) }),
+    })
+      .annotateMerge(locationQueryOpenApi)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.fs.upload",
+          summary: "Upload file",
+          description: "Upload one file into the uploads directory of the requested location.",
+        }),
+      ),
+  )
+  .add(
+    HttpApiEndpoint.get("fs.uploaded", "/api/fs/uploaded", {
+      query: LocationQuery,
+      success: Schema.Struct({ data: Schema.Array(FileSystem.UploadEntry) }),
+    })
+      .annotateMerge(locationQueryOpenApi)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.fs.uploaded",
+          summary: "List uploaded files",
+          description: "List files in the uploads directory of the requested location.",
+        }),
+      ),
+  )
+  .add(
+    HttpApiEndpoint.delete("fs.deleteUpload", "/api/fs/upload/*", {
+      query: LocationQuery,
+      success: Schema.Void,
+    })
+      .annotateMerge(locationQueryOpenApi)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.fs.deleteUpload",
+          summary: "Delete uploaded file",
+          description: "Delete one file from the uploads directory of the requested location.",
+        }),
+      ),
   )
