@@ -9,6 +9,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SkillV2 } from "@opencode-ai/core/skill"
 import { SkillDiscovery } from "@opencode-ai/core/skill/discovery"
+import { UserContext } from "@opencode-ai/schema/user-context"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
@@ -72,15 +73,10 @@ describe("SkillV2", () => {
             { type: "directory", path: AbsolutePath.make(second) },
           ])
           expect(yield* skill.list()).toEqual([
-            SkillV2.Info.make({
-              name: "foo",
-              slash: true,
-              location: AbsolutePath.make(path.join(first, "foo.md")),
-              content: "# foo",
-            }),
             {
               name: "review",
               description: "Second",
+              scope: { type: "global" },
               location: AbsolutePath.make(path.join(second, "review", "SKILL.md")),
               content: "# review",
             },
@@ -118,6 +114,54 @@ describe("SkillV2", () => {
           expect((yield* skill.list()).map((item) => item.name)).toEqual(["deploy"])
           expect(pulls).toBe(1)
           expect(SkillV2.available(yield* skill.list(), (yield* agents.get(AgentV2.ID.make("reviewer")))!)).toEqual([])
+        }),
+      ),
+    ),
+  )
+
+  it.live("global_admin list returns skills across all scopes", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(tmp.path, "global"), { recursive: true })
+            await fs.mkdir(path.join(tmp.path, "dept_eng"), { recursive: true })
+            await fs.mkdir(path.join(tmp.path, "dept_sales"), { recursive: true })
+            await fs.mkdir(path.join(tmp.path, "user_u1"), { recursive: true })
+            await fs.mkdir(path.join(tmp.path, "user_u2"), { recursive: true })
+            await write(tmp.path, "global", "Global skill")
+            await write(tmp.path, "dept_eng", "Engineering")
+            await write(tmp.path, "dept_sales", "Sales")
+            await write(tmp.path, "user_u1", "Personal one")
+            await write(tmp.path, "user_u2", "Personal two")
+          })
+
+          const skill = yield* SkillV2.Service
+          yield* skill.transform((editor) => editor.source({ type: "directory", path: AbsolutePath.make(tmp.path) }))
+
+          const globalAdmin = UserContext.Info.make({
+            userID: "u1",
+            username: "admin",
+            departmentCode: "eng",
+            role: "global_admin",
+            permissions: [],
+          })
+          const adminNames = (yield* skill.list(globalAdmin)).map((item) => item.name).toSorted()
+          expect(adminNames).toEqual(["dept_eng", "dept_sales", "global", "user_u1", "user_u2"].toSorted())
+
+          // A plain user in eng sees only global + own dept + own personal skills
+          const user = UserContext.Info.make({
+            userID: "u1",
+            username: "bob",
+            departmentCode: "eng",
+            role: "user",
+            permissions: [],
+          })
+          const userNames = (yield* skill.list(user)).map((item) => item.name).toSorted()
+          expect(userNames).toEqual(["dept_eng", "global", "user_u1"].toSorted())
         }),
       ),
     ),

@@ -260,6 +260,8 @@ const layer = Layer.effect(
 
       // Filter by user context if provided
       if (!userContext) return all
+      // Global admins see skills across ALL scopes (global + all departments + all users)
+      if (userContext.role === "global_admin") return all
       return all.filter((skill) => {
         const scope = skill.scope
         if (!scope || scope.type === "global") return true
