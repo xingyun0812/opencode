@@ -29,8 +29,11 @@ export const Input = Schema.Struct({
   content: Schema.String.pipe(Schema.optional).annotate({
     description: "create only: full SKILL.md body (required for create)",
   }),
-  scope: Schema.Struct({ type: ScopeType }).pipe(Schema.optional).annotate({
-    description: "create only: scope type — user (default), department (your department), or global (global_admin only). Identity is always taken from the current user, never from this input.",
+  scope: Schema.Struct({
+    type: ScopeType,
+    departmentCode: Schema.String.pipe(Schema.optional),
+  }).pipe(Schema.optional).annotate({
+    description: "create only: scope type — user (default), department (your department), or global (global_admin only). `userID`/`departmentCode` for ordinary users are always taken from the current user and any value here is ignored for them; `departmentCode` is honored only for `global_admin` creating a department skill (the target department to create for), since an admin may create for any department.",
   }),
 })
 
@@ -118,10 +121,15 @@ const layer = Layer.effectDiscard(
                     message: "Creating a skill requires `content` (the SKILL.md body)",
                   })
                 }
-                // Identity is enforced from UserContext — the scope input only
-                // carries the type; userID/departmentCode are resolved server-side.
+                // Identity is enforced from UserContext for ordinary users
+                // (userID/departmentCode pinned to their own). `departmentCode`
+                // is only honored for `global_admin` creating a department
+                // skill — the target department to create for.
                 const requestedType = input.scope?.type ?? "user"
-                const enforcedScope = yield* resolveCreateScope(userContext, { type: requestedType }).pipe(
+                const enforcedScope = yield* resolveCreateScope(userContext, {
+                  type: requestedType,
+                  departmentCode: input.scope?.departmentCode,
+                }).pipe(
                   Effect.mapError((err) => new ToolFailure({ message: err.message })),
                 )
                 yield* checkScopeAccess(userContext, enforcedScope).pipe(
@@ -138,13 +146,11 @@ const layer = Layer.effectDiscard(
                   })
                   .pipe(
                     // core `create` raises ConflictError (same name) /
-                    // InvalidNameError (bad name); both surface to the model as
-                    // a ToolFailure carrying the core message.
+                    // InvalidNameError (bad name/scope identity); both surface
+                    // to the model as a ToolFailure carrying the core message.
                     Effect.mapError(
                       (err): ToolFailure =>
-                        new ToolFailure({
-                          message: err instanceof Error ? err.message : `Failed to create skill ${input.name}`,
-                        }),
+                        new ToolFailure({ message: err.message }),
                     ),
                   )
                 const directory = path.dirname(created.location)

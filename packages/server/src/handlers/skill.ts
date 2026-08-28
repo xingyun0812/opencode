@@ -12,7 +12,7 @@ import { SkillNotFoundError, SkillNameConflictError } from "@opencode-ai/protoco
 // conversation tool share one implementation. They raise core-owned errors
 // (`SkillV2.ForbiddenError` / `ConflictError` / `InvalidNameError`); this
 // handler maps them to the protocol error shapes the HTTP API exposes.
-const { checkScopeAccess, resolveCreateScope, ForbiddenError: SkillForbiddenError, ConflictError: SkillConflictError, InvalidNameError: SkillInvalidNameError } = SkillV2
+const { checkScopeAccess, resolveCreateScope, ConflictError: SkillConflictError, InvalidNameError: SkillInvalidNameError } = SkillV2
 
 export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers) =>
   Effect.gen(function* () {

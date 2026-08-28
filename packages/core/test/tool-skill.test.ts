@@ -323,6 +323,55 @@ describe("SkillTool create", () => {
     ),
   )
 
+  it.live("lets a global_admin create a department skill for a target department via scope.departmentCode", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          // global_admin has no department of their own; they specify the target
+          // department via scope.departmentCode. ordinary users cannot do this —
+          // resolveCreateScope pins them to their own departmentCode regardless.
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-admin-dept", name: "skill", input: { action: "create", name: "team", scope: { type: "department", departmentCode: "D9" }, content: "# Team" } },
+          })
+          expect(result).toMatchObject({ type: "text" })
+          expect(
+            (yield* Effect.promise(() => fs.readFile(path.join(tmp.path, "dept_D9", "team", "SKILL.md"), "utf8"))) as string,
+          ).toContain("name: team")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext({ role: "global_admin", departmentCode: undefined }))),
+      ),
+    ),
+  )
+
+  it.live("pins an ordinary user's department create to their own department (ignores scope.departmentCode)", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          // A plain user tries to target D9; identity enforcement pins them to
+          // their own D1, so the skill lands in dept_D1 — not D9.
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-user-dept-pinned", name: "skill", input: { action: "create", name: "team", scope: { type: "department", departmentCode: "D9" }, content: "# Team" } },
+          })
+          expect(result).toMatchObject({ type: "text" })
+          expect(
+            (yield* Effect.promise(() => fs.readFile(path.join(tmp.path, "dept_D1", "team", "SKILL.md"), "utf8"))) as string,
+          ).toContain("name: team")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext({ role: "user", departmentCode: "D1" }))),
+      ),
+    ),
+  )
+
   it.live("rejects a same-name create in the same scope (ConflictError → ToolFailure)", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),

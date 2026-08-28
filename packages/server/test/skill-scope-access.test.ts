@@ -6,7 +6,7 @@ import type { UserContext } from "@opencode-ai/schema/user-context"
 // `checkScopeAccess` / `resolveCreateScope` live in core (shared by the HTTP
 // handler and the conversation tool). They raise core-owned
 // `SkillV2.ForbiddenError` (_tag "SkillV2.ForbiddenError").
-const { checkScopeAccess, resolveCreateScope, ForbiddenError: SkillForbiddenError } = SkillV2
+const { checkScopeAccess, resolveCreateScope } = SkillV2
 
 // `checkScopeAccess` is a pure function over (UserContext | undefined, scope)
 // → Effect<void, ForbiddenError>. These tests exercise the scope-access rules
