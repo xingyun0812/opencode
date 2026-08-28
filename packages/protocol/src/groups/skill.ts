@@ -3,7 +3,7 @@ import { Location } from "@opencode-ai/schema/location"
 import { Schema } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import { LocationQuery, locationQueryOpenApi } from "./location"
-import { ForbiddenError } from "../errors"
+import { ForbiddenError, InvalidRequestError } from "../errors"
 
 const SkillCreateBody = Schema.Struct({
   name: Schema.String,
@@ -56,7 +56,7 @@ export const SkillGroup = HttpApiGroup.make("server.skill")
     HttpApiEndpoint.post("skill.create", "/api/skill", {
       payload: SkillCreateBody,
       success: Schema.Struct({ data: Skill.Info }),
-      error: ForbiddenError,
+      error: [ForbiddenError, InvalidRequestError, SkillNameConflictError],
     }).annotateMerge(
       OpenApi.annotations({
         identifier: "v2.skill.create",

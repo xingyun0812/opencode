@@ -5,74 +5,14 @@ import { Effect, Option } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
 import { response } from "../location"
-import { ForbiddenError } from "@opencode-ai/protocol/errors"
-import { SkillNotFoundError } from "@opencode-ai/protocol/groups/skill"
+import { ForbiddenError, InvalidRequestError } from "@opencode-ai/protocol/errors"
+import { SkillNotFoundError, SkillNameConflictError } from "@opencode-ai/protocol/groups/skill"
 
-// ─── Scope validation ─────────────────────────────────────────────
-
-// Exported for direct unit testing of the scope-access rules.
-// Department scope is open to any member of the target department (any role),
-// not restricted to `dept_admin`. `global_admin` still short-circuits to allow.
-export function checkScopeAccess(
-  userContext: UserContext.Info | undefined,
-  scope: { type: "global" | "department" | "user"; departmentCode?: string; userID?: string },
-): Effect.Effect<void, ForbiddenError> {
-  if (!userContext) return Effect.void
-  switch (scope.type) {
-    case "global":
-      if (userContext.role === "global_admin") return Effect.void
-      return Effect.fail(new ForbiddenError({ message: "Only global administrators can manage global skills" }))
-    case "department":
-      if (userContext.role === "global_admin") return Effect.void
-      if (userContext.departmentCode === undefined) {
-        return Effect.fail(new ForbiddenError({ message: "You are not a member of any department" }))
-      }
-      if (scope.departmentCode !== userContext.departmentCode) {
-        return Effect.fail(new ForbiddenError({ message: "You can only manage skills in your own department" }))
-      }
-      return Effect.void
-    case "user":
-      // `userContext` is present (the `if (!userContext)` branch above handles
-      // absence), so userID — non-optional on UserContext.Info — always exists.
-      // Guard only against a scope targeting someone else.
-      if (scope.userID !== undefined && scope.userID !== userContext.userID) {
-        return Effect.fail(new ForbiddenError({ message: "You can only manage your own personal skills" }))
-      }
-      return Effect.void
-  }
-}
-
-// The scope the create path will actually write, with identity enforced from
-// UserContext for ordinary users. `global_admin` keeps the requested scope (it
-// may create for any department, so its departmentCode comes from the request).
-// Exported so the enforce-identity contract is unit-tested without mounting the
-// full HTTP handler stack.
-export function resolveCreateScope(
-  userContext: UserContext.Info,
-  requested: { type: "global" | "department" | "user"; departmentCode?: string; userID?: string },
-): Effect.Effect<
-  { type: "global" } | { type: "department"; departmentCode: string } | { type: "user"; userID: string },
-  ForbiddenError
-> {
-  const isGlobalAdmin = userContext.role === "global_admin"
-  if (requested.type === "department") {
-    const departmentCode = isGlobalAdmin ? requested.departmentCode : userContext.departmentCode
-    if (departmentCode === undefined) {
-      return Effect.fail(
-        new ForbiddenError({
-          message: isGlobalAdmin
-            ? "Creating a department skill requires a departmentCode"
-            : "You are not a member of any department",
-        }),
-      )
-    }
-    return Effect.succeed({ type: "department", departmentCode })
-  }
-  if (requested.type === "user") {
-    return Effect.succeed({ type: "user", userID: userContext.userID })
-  }
-  return Effect.succeed({ type: "global" })
-}
+// Scope-access + identity resolution live in core so the HTTP handler and the
+// conversation tool share one implementation. They raise core-owned errors
+// (`SkillV2.ForbiddenError` / `ConflictError` / `InvalidNameError`); this
+// handler maps them to the protocol error shapes the HTTP API exposes.
+const { checkScopeAccess, resolveCreateScope, ForbiddenError: SkillForbiddenError, ConflictError: SkillConflictError, InvalidNameError: SkillInvalidNameError } = SkillV2
 
 export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers) =>
   Effect.gen(function* () {
@@ -109,10 +49,16 @@ export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers)
           // may create for any department); everyone else is pinned to their
           // own identity. This closes the hole where omitting departmentCode
           // would short-circuit the ownership check.
-          const enforcedScope = yield* resolveCreateScope(userContext, ctx.payload.scope)
+          const enforcedScope = yield* resolveCreateScope(userContext, ctx.payload.scope).pipe(
+            Effect.mapError((err) => new ForbiddenError({ message: err.message })),
+          )
 
-          yield* checkScopeAccess(userContext, enforcedScope)
+          yield* checkScopeAccess(userContext, enforcedScope).pipe(
+            Effect.mapError((err) => new ForbiddenError({ message: err.message })),
+          )
 
+          // core `create` raises ConflictError (same name) / InvalidNameError
+          // (bad name); map to the protocol shapes the HTTP API exposes.
           const result = yield* SkillV2.Service.use((skill) =>
             skill.create({
               name: ctx.payload.name,
@@ -120,6 +66,18 @@ export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers)
               content: ctx.payload.content,
               scope: enforcedScope,
               skillsRoot,
+            }),
+          ).pipe(
+            Effect.mapError((err): ForbiddenError | SkillNameConflictError | InvalidRequestError => {
+              if (err instanceof SkillConflictError) {
+                return new SkillNameConflictError({ name: err.name, message: err.message })
+              }
+              if (err instanceof SkillInvalidNameError) {
+                return new InvalidRequestError({ message: err.message })
+              }
+              // `ConflictError | InvalidNameError` are exhausted above; this is
+              // a defensive fallback for any future core error type.
+              return new ForbiddenError({ message: "Failed to create skill" })
             }),
           )
           return { data: result }
@@ -143,7 +101,7 @@ export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers)
             type: existing.scope?.type ?? "global",
             departmentCode: existing.scope?.departmentCode,
             userID: existing.scope?.userID,
-          })
+          }).pipe(Effect.mapError((err) => new ForbiddenError({ message: err.message })))
 
           return {
             data: yield* SkillV2.Service.use((skill) =>
@@ -174,7 +132,7 @@ export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers)
             type: existing.scope?.type ?? "global",
             departmentCode: existing.scope?.departmentCode,
             userID: existing.scope?.userID,
-          })
+          }).pipe(Effect.mapError((err) => new ForbiddenError({ message: err.message })))
 
           yield* SkillV2.Service.use((skill) => skill.remove(ctx.params.name))
           return HttpApiSchema.NoContent.make()

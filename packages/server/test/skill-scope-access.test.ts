@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import { ForbiddenError } from "@opencode-ai/protocol/errors"
+import { SkillV2 } from "@opencode-ai/core/skill"
 import type { UserContext } from "@opencode-ai/schema/user-context"
-import { checkScopeAccess, resolveCreateScope } from "@opencode-ai/server/handlers/skill"
+
+// `checkScopeAccess` / `resolveCreateScope` live in core (shared by the HTTP
+// handler and the conversation tool). They raise core-owned
+// `SkillV2.ForbiddenError` (_tag "SkillV2.ForbiddenError").
+const { checkScopeAccess, resolveCreateScope, ForbiddenError: SkillForbiddenError } = SkillV2
 
 // `checkScopeAccess` is a pure function over (UserContext | undefined, scope)
 // → Effect<void, ForbiddenError>. These tests exercise the scope-access rules
@@ -35,7 +39,7 @@ async function verdict(
   const either = await Effect.runPromise(
     checkScopeAccess(userContext, scope).pipe(
       Effect.map(() => "ok" as const),
-      Effect.catchTag("ForbiddenError", (e: ForbiddenError) => Effect.succeed(e.message)),
+      Effect.catchTag("SkillV2.ForbiddenError", (e) => Effect.succeed(e.message)),
     ),
   )
   return either
@@ -135,7 +139,7 @@ async function resolve(
   const either = await Effect.runPromise(
     resolveCreateScope(userContext, requested).pipe(
       Effect.map((scope) => ({ ok: true as const, scope })),
-      Effect.catchTag("ForbiddenError", (e: ForbiddenError) => Effect.succeed({ ok: false as const, message: e.message })),
+      Effect.catchTag("SkillV2.ForbiddenError", (e) => Effect.succeed({ ok: false as const, message: e.message })),
     ),
   )
   return either

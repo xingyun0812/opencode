@@ -1,7 +1,7 @@
 import fs from "fs/promises"
 import path from "path"
 import { describe, expect } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect, Exit, Layer } from "effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -118,6 +118,156 @@ describe("SkillV2", () => {
           expect((yield* skill.list()).map((item) => item.name)).toEqual(["deploy"])
           expect(pulls).toBe(1)
           expect(SkillV2.available(yield* skill.list(), (yield* agents.get(AgentV2.ID.make("reviewer")))!)).toEqual([])
+        }),
+      ),
+    ),
+  )
+
+  it.live("create writes a scoped skill to disk and makes it visible to list", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const skill = yield* SkillV2.Service
+          yield* skill.transform((editor) =>
+            editor.source({ type: "directory", path: AbsolutePath.make(tmp.path) }),
+          )
+
+          const created = yield* skill.create({
+            name: "deploy",
+            description: "Deploy guidance",
+            content: "# Deploy\n\nSteps",
+            scope: { type: "department", departmentCode: "D1" },
+            skillsRoot: tmp.path,
+          })
+          expect(created.name).toBe("deploy")
+          expect(created.scope).toEqual({ type: "department", departmentCode: "D1" })
+
+          // Written to <skillsRoot>/dept_<code>/<name>/SKILL.md
+          const onDisk = (yield* Effect.promise(() =>
+            fs.readFile(path.join(tmp.path, "dept_D1", "deploy", "SKILL.md"), "utf8"),
+          )) as string
+          expect(onDisk).toContain("name: deploy")
+          expect(onDisk).toContain("# Deploy")
+
+          // Visible via list() (no userContext → all scopes)
+          const all = yield* skill.list()
+          expect(all.map((s) => s.name)).toContain("deploy")
+        }),
+      ),
+    ),
+  )
+
+  it.live("create refuses to overwrite a same-name skill in the same scope (ConflictError)", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const skill = yield* SkillV2.Service
+          yield* skill.transform((editor) =>
+            editor.source({ type: "directory", path: AbsolutePath.make(tmp.path) }),
+          )
+          yield* skill.create({
+            name: "deploy",
+            content: "first",
+            scope: { type: "user", userID: "u1" },
+            skillsRoot: tmp.path,
+          })
+          const again = yield* skill
+            .create({
+              name: "deploy",
+              content: "second",
+              scope: { type: "user", userID: "u1" },
+              skillsRoot: tmp.path,
+            })
+            .pipe(Effect.exit)
+          expect(Exit.isFailure(again)).toBe(true)
+          expect(String(again)).toContain("already exists")
+          // Cross-scope same name is allowed (isolated by list(userContext))
+          const cross = yield* skill
+            .create({
+              name: "deploy",
+              content: "other-user",
+              scope: { type: "user", userID: "u2" },
+              skillsRoot: tmp.path,
+            })
+            .pipe(Effect.exit)
+          expect(Exit.isSuccess(cross)).toBe(true)
+        }),
+      ),
+    ),
+  )
+
+  it.live("create rejects invalid skill names (InvalidNameError)", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const skill = yield* SkillV2.Service
+          for (const badName of ["Deploy", "with space", "has/slash", "traversal.."]) {
+            const res = yield* skill
+              .create({
+                name: badName,
+                content: "x",
+                scope: { type: "user", userID: "u1" },
+                skillsRoot: tmp.path,
+              })
+              .pipe(Effect.exit)
+            expect(Exit.isFailure(res)).toBe(true)
+            expect(String(res)).toContain("Invalid skill name")
+          }
+        }),
+      ),
+    ),
+  )
+
+  it.live("list(userContext) isolates skills by scope (read isolation)", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const skill = yield* SkillV2.Service
+          yield* skill.transform((editor) =>
+            editor.source({ type: "directory", path: AbsolutePath.make(tmp.path) }),
+          )
+          yield* skill.create({
+            name: "personal-a",
+            content: "a",
+            scope: { type: "user", userID: "u1" },
+            skillsRoot: tmp.path,
+          })
+          yield* skill.create({
+            name: "personal-b",
+            content: "b",
+            scope: { type: "user", userID: "u2" },
+            skillsRoot: tmp.path,
+          })
+          yield* skill.create({
+            name: "dept-skill",
+            content: "d",
+            scope: { type: "department", departmentCode: "D1" },
+            skillsRoot: tmp.path,
+          })
+
+          const u1 = { userID: "u1", username: "a", departmentCode: "D1", role: "user" as const, permissions: [] }
+          const visibleToU1 = (yield* skill.list(u1)).map((s) => s.name)
+          expect(visibleToU1).toContain("personal-a")
+          expect(visibleToU1).toContain("dept-skill")
+          expect(visibleToU1).not.toContain("personal-b")
+
+          const u2 = { userID: "u2", username: "b", departmentCode: "D2", role: "user" as const, permissions: [] }
+          const visibleToU2 = (yield* skill.list(u2)).map((s) => s.name)
+          expect(visibleToU2).toContain("personal-b")
+          expect(visibleToU2).not.toContain("personal-a")
+          expect(visibleToU2).not.toContain("dept-skill")
         }),
       ),
     ),
