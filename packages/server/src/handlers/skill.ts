@@ -10,7 +10,10 @@ import { SkillNotFoundError } from "@opencode-ai/protocol/groups/skill"
 
 // ─── Scope validation ─────────────────────────────────────────────
 
-function checkScopeAccess(
+// Exported for direct unit testing of the scope-access rules.
+// Department scope is open to any member of the target department (any role),
+// not restricted to `dept_admin`. `global_admin` still short-circuits to allow.
+export function checkScopeAccess(
   userContext: UserContext.Info | undefined,
   scope: { type: "global" | "department" | "user"; departmentCode?: string; userID?: string },
 ): Effect.Effect<void, ForbiddenError> {
@@ -21,15 +24,18 @@ function checkScopeAccess(
       return Effect.fail(new ForbiddenError({ message: "Only global administrators can manage global skills" }))
     case "department":
       if (userContext.role === "global_admin") return Effect.void
-      if (userContext.role !== "dept_admin") {
-        return Effect.fail(new ForbiddenError({ message: "Only department administrators can manage department skills" }))
+      if (userContext.departmentCode === undefined) {
+        return Effect.fail(new ForbiddenError({ message: "You are not a member of any department" }))
       }
-      if (scope.departmentCode && scope.departmentCode !== userContext.departmentCode) {
+      if (scope.departmentCode !== userContext.departmentCode) {
         return Effect.fail(new ForbiddenError({ message: "You can only manage skills in your own department" }))
       }
       return Effect.void
     case "user":
-      if (scope.userID && scope.userID !== userContext.userID) {
+      if (userContext.userID === undefined) {
+        return Effect.fail(new ForbiddenError({ message: "No authenticated user identity" }))
+      }
+      if (scope.userID !== undefined && scope.userID !== userContext.userID) {
         return Effect.fail(new ForbiddenError({ message: "You can only manage your own personal skills" }))
       }
       return Effect.void
@@ -56,14 +62,41 @@ export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers)
           const location = yield* Location.Service
           const skillsRoot = location.directory
 
-          yield* checkScopeAccess(userContext, ctx.payload.scope)
+          // Caller-side gate: creation requires an authenticated user context.
+          // `checkScopeAccess` still returns Effect.void when userContext is
+          // undefined (to keep read-only list/load paths unchanged), so the
+          // create path enforces identity here instead.
+          if (!userContext) {
+            return yield* Effect.fail(
+              new ForbiddenError({ message: "Creating skills requires an authenticated user context" }),
+            )
+          }
+
+          // Enforce identity from UserContext, never trusting the request body:
+          // departmentCode / userID are overridden with the current user's own
+          // identity. This closes the hole where omitting departmentCode would
+          // short-circuit the ownership check.
+          const requested = ctx.payload.scope
+          if (requested.type === "department" && userContext.departmentCode === undefined) {
+            return yield* Effect.fail(
+              new ForbiddenError({ message: "You are not a member of any department" }),
+            )
+          }
+          const enforcedScope =
+            requested.type === "department"
+              ? { type: "department" as const, departmentCode: userContext.departmentCode! }
+              : requested.type === "user"
+                ? { type: "user" as const, userID: userContext.userID }
+                : { type: "global" as const }
+
+          yield* checkScopeAccess(userContext, enforcedScope)
 
           const result = yield* SkillV2.Service.use((skill) =>
             skill.create({
               name: ctx.payload.name,
               description: ctx.payload.description,
               content: ctx.payload.content,
-              scope: ctx.payload.scope,
+              scope: enforcedScope,
               skillsRoot,
             }),
           )
