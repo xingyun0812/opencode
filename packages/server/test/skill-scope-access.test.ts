@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { ForbiddenError } from "@opencode-ai/protocol/errors"
 import type { UserContext } from "@opencode-ai/schema/user-context"
-import { checkScopeAccess } from "@opencode-ai/server/handlers/skill"
+import { checkScopeAccess, resolveCreateScope } from "@opencode-ai/server/handlers/skill"
 
 // `checkScopeAccess` is a pure function over (UserContext | undefined, scope)
 // → Effect<void, ForbiddenError>. These tests exercise the scope-access rules
@@ -110,13 +110,6 @@ describe("checkScopeAccess — user scope", () => {
   test("another userID rejected", async () => {
     expect(await verdict(user({ userID: "u1" }), { type: "user", userID: "u2" })).toBe("You can only manage your own personal skills")
   })
-
-  test("missing user identity rejected (no authenticated user identity)", async () => {
-    // Info.userID is typed as string, but guard against the unauthenticated
-    // case where identity couldn't be derived. Use undefined explicitly.
-    const msg = await verdict({ ...user(), userID: undefined as unknown as string }, { type: "user", userID: undefined })
-    expect(msg).toBe("No authenticated user identity")
-  })
 })
 
 describe("checkScopeAccess — no user context (read-only path passthrough)", () => {
@@ -127,5 +120,67 @@ describe("checkScopeAccess — no user context (read-only path passthrough)", ()
     expect(await verdict(undefined, { type: "global" })).toBe("ok")
     expect(await verdict(undefined, { type: "department", departmentCode: "D1" })).toBe("ok")
     expect(await verdict(undefined, { type: "user", userID: "u1" })).toBe("ok")
+  })
+})
+
+// `resolveCreateScope` is the create-path identity-enforcement contract: it
+// decides which scope is actually written, given the caller (always
+// authenticated — the handler rejects undefined userContext first) and the
+// requested scope. This is the core of the security fix, so it is tested
+// directly rather than through the full HTTP stack.
+async function resolve(
+  userContext: UserContext.Info,
+  requested: Scope,
+): Promise<{ ok: true; scope: unknown } | { ok: false; message: string }> {
+  const either = await Effect.runPromise(
+    resolveCreateScope(userContext, requested).pipe(
+      Effect.map((scope) => ({ ok: true as const, scope })),
+      Effect.catchTag("ForbiddenError", (e: ForbiddenError) => Effect.succeed({ ok: false as const, message: e.message })),
+    ),
+  )
+  return either
+}
+
+describe("resolveCreateScope — create-path identity enforcement", () => {
+  test("plain user creating department is pinned to own departmentCode (ignores request body)", async () => {
+    const res = await resolve(user({ role: "user", departmentCode: "D1" }), { type: "department", departmentCode: "D2" })
+    expect(res).toEqual({ ok: true, scope: { type: "department", departmentCode: "D1" } })
+  })
+
+  test("plain user creating department without departmentCode in request still pinned to own", async () => {
+    const res = await resolve(user({ role: "user", departmentCode: "D1" }), { type: "department" })
+    expect(res).toEqual({ ok: true, scope: { type: "department", departmentCode: "D1" } })
+  })
+
+  test("plain user with no department is rejected", async () => {
+    const res = await resolve(user({ role: "user", departmentCode: undefined }), { type: "department", departmentCode: "D1" })
+    expect(res).toEqual({ ok: false, message: "You are not a member of any department" })
+  })
+
+  test("global_admin creating a foreign department keeps the requested departmentCode (regression: must not be rewired to own or rejected)", async () => {
+    // global_admin may create for ANY department; do not override with their
+    // own departmentCode, and do not reject when their departmentCode differs.
+    const res = await resolve(user({ role: "global_admin", departmentCode: "D1" }), { type: "department", departmentCode: "D2" })
+    expect(res).toEqual({ ok: true, scope: { type: "department", departmentCode: "D2" } })
+  })
+
+  test("global_admin with no department can still create a department skill (uses requested code)", async () => {
+    const res = await resolve(user({ role: "global_admin", departmentCode: undefined }), { type: "department", departmentCode: "D2" })
+    expect(res).toEqual({ ok: true, scope: { type: "department", departmentCode: "D2" } })
+  })
+
+  test("global_admin creating a department skill without a departmentCode is rejected (write target undefined)", async () => {
+    const res = await resolve(user({ role: "global_admin", departmentCode: undefined }), { type: "department" })
+    expect(res).toEqual({ ok: false, message: "Creating a department skill requires a departmentCode" })
+  })
+
+  test("creating user scope is pinned to own userID (ignores request body)", async () => {
+    const res = await resolve(user({ userID: "u1" }), { type: "user", userID: "u2" })
+    expect(res).toEqual({ ok: true, scope: { type: "user", userID: "u1" } })
+  })
+
+  test("creating global scope yields a clean global scope regardless of request identity fields", async () => {
+    const res = await resolve(user({ role: "user" }), { type: "global" })
+    expect(res).toEqual({ ok: true, scope: { type: "global" } })
   })
 })

@@ -32,14 +32,46 @@ export function checkScopeAccess(
       }
       return Effect.void
     case "user":
-      if (userContext.userID === undefined) {
-        return Effect.fail(new ForbiddenError({ message: "No authenticated user identity" }))
-      }
+      // `userContext` is present (the `if (!userContext)` branch above handles
+      // absence), so userID — non-optional on UserContext.Info — always exists.
+      // Guard only against a scope targeting someone else.
       if (scope.userID !== undefined && scope.userID !== userContext.userID) {
         return Effect.fail(new ForbiddenError({ message: "You can only manage your own personal skills" }))
       }
       return Effect.void
   }
+}
+
+// The scope the create path will actually write, with identity enforced from
+// UserContext for ordinary users. `global_admin` keeps the requested scope (it
+// may create for any department, so its departmentCode comes from the request).
+// Exported so the enforce-identity contract is unit-tested without mounting the
+// full HTTP handler stack.
+export function resolveCreateScope(
+  userContext: UserContext.Info,
+  requested: { type: "global" | "department" | "user"; departmentCode?: string; userID?: string },
+): Effect.Effect<
+  { type: "global" } | { type: "department"; departmentCode: string } | { type: "user"; userID: string },
+  ForbiddenError
+> {
+  const isGlobalAdmin = userContext.role === "global_admin"
+  if (requested.type === "department") {
+    const departmentCode = isGlobalAdmin ? requested.departmentCode : userContext.departmentCode
+    if (departmentCode === undefined) {
+      return Effect.fail(
+        new ForbiddenError({
+          message: isGlobalAdmin
+            ? "Creating a department skill requires a departmentCode"
+            : "You are not a member of any department",
+        }),
+      )
+    }
+    return Effect.succeed({ type: "department", departmentCode })
+  }
+  if (requested.type === "user") {
+    return Effect.succeed({ type: "user", userID: userContext.userID })
+  }
+  return Effect.succeed({ type: "global" })
 }
 
 export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers) =>
@@ -72,22 +104,12 @@ export const SkillHandler = HttpApiBuilder.group(Api, "server.skill", (handlers)
             )
           }
 
-          // Enforce identity from UserContext, never trusting the request body:
-          // departmentCode / userID are overridden with the current user's own
-          // identity. This closes the hole where omitting departmentCode would
-          // short-circuit the ownership check.
-          const requested = ctx.payload.scope
-          if (requested.type === "department" && userContext.departmentCode === undefined) {
-            return yield* Effect.fail(
-              new ForbiddenError({ message: "You are not a member of any department" }),
-            )
-          }
-          const enforcedScope =
-            requested.type === "department"
-              ? { type: "department" as const, departmentCode: userContext.departmentCode! }
-              : requested.type === "user"
-                ? { type: "user" as const, userID: userContext.userID }
-                : { type: "global" as const }
+          // Enforce identity from UserContext, never trusting the request body
+          // for ordinary users. `global_admin` keeps the requested scope (it
+          // may create for any department); everyone else is pinned to their
+          // own identity. This closes the hole where omitting departmentCode
+          // would short-circuit the ownership check.
+          const enforcedScope = yield* resolveCreateScope(userContext, ctx.payload.scope)
 
           yield* checkScopeAccess(userContext, enforcedScope)
 
