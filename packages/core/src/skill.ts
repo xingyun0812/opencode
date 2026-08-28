@@ -46,6 +46,16 @@ function isValidSkillName(name: string): boolean {
   return SKILL_NAME_RE.test(name)
 }
 
+// Scope identity fields (departmentCode/userID) become path segments on disk
+// (`<skillsRoot>/dept_<code>/...` / `user_<id>/...`), so they must not carry
+// path separators or traversal sequences. They originate from JWT claims / the
+// request body, so validating at the write boundary closes a path-traversal
+// vector independent of how identity is supplied.
+const SCOPE_IDENTITY_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/
+function isValidScopeIdentity(value: unknown): boolean {
+  return typeof value === "string" && !value.includes("..") && SCOPE_IDENTITY_RE.test(value)
+}
+
 function parseScopeDir(dirname: string): { type: "global" | "department" | "user"; owner?: string } | undefined {
   if (dirname === SCOPE_GLOBAL) return { type: "global" }
   const deptMatch = dirname.match(/^dept_(.+)$/)
@@ -74,6 +84,17 @@ function parseScope(info: Skill.Info): Skill.Info {
 
   // Legacy: no scope directory, default to global
   return { ...info, scope: { type: "global" } }
+}
+
+// A stable string identity for a skill's scope, used to dedupe across sources
+// WITHOUT collapsing cross-scope same-name skills into one another. Deduping by
+// `skill.name` alone would let a `user_u2/deploy` loaded later overwrite a
+// `user_u1/deploy` loaded earlier in the Map, so `list(u1)` could lose u1's own
+// skill entirely — breaking read isolation. Keying by name+scope preserves both.
+function scopeKey(scope: Skill.Info["scope"]): string {
+  if (!scope || scope.type === "global") return "global"
+  if (scope.type === "department") return `dept_${scope.departmentCode}`
+  return `user_${scope.userID}`
 }
 
 const Frontmatter = Schema.Struct({
@@ -277,11 +298,15 @@ const layer = Layer.effect(
           }
         }
 
-        // Process flat directories (migration compat: existing skills outside any scope dir)
+        // Process flat directories (migration compat: existing skills outside any scope dir).
+        // Only `SKILL.md` files are recognized here so that unrelated markdown in
+        // sibling directories of the skills root (e.g. plans/notes with
+        // frontmatter) is not misread as a global skill. The legacy
+        // `<dir>/<name>.md` flat layout is only honored inside scope directories.
         for (const flatDir of flatDirs) {
           const flatPath = path.join(directory, flatDir.name)
           const files = yield* fs
-            .glob("{*.md,**/SKILL.md}", {
+            .glob("**/SKILL.md", {
               cwd: flatPath,
               absolute: true,
               include: "file",
@@ -295,10 +320,13 @@ const layer = Layer.effect(
           }
         }
 
-        // Also handle top-level markdown files (completely flat structure with no subdirectories)
+        // Also handle top-level markdown files (completely flat structure with no subdirectories).
+        // Same SKILL.md-only rule: registering the skills root itself as a source
+        // would otherwise let the project root's README/notes (any .md with
+        // frontmatter) leak in as global skills.
         if (dirs.length === 0) {
           const files = yield* fs
-            .glob("{*.md,**/SKILL.md}", {
+            .glob("**/SKILL.md", {
               cwd: directory,
               absolute: true,
               include: "file",
@@ -355,12 +383,15 @@ const layer = Layer.effect(
       cache.clear()
     }
     const list = Effect.fn("SkillV2.list")(function* (userContext?: UserContext.Info) {
+      // Key by name+scope so cross-scope same-name skills (e.g. user_u1/deploy
+      // and user_u2/deploy) survive source merge instead of one overwriting
+      // the other — only then does per-user filtering pick the right one.
       const skills = new Map<string, Info>()
       for (const source of state.get().sources) {
         const key = Source.key(source)
         const loaded = cache.get(key) ?? (yield* load(source))
         cache.set(key, loaded)
-        for (const skill of loaded) skills.set(skill.name, skill)
+        for (const skill of loaded) skills.set(`${scopeKey(skill.scope)}@${skill.name}`, skill)
       }
       const all = Array.from(skills.values())
 
@@ -392,12 +423,27 @@ const layer = Layer.effect(
             message: `Invalid skill name: ${input.name} (must be lowercase, no spaces or path separators)`,
           })
         }
+        // Scope-identity validation: departmentCode/userID become path segments,
+        // so reject separators/traversal to prevent escaping skillsRoot.
+        if (input.scope.type === "department" && !isValidScopeIdentity(input.scope.departmentCode)) {
+          return yield* new InvalidNameError({
+            name: input.name,
+            message: "Invalid departmentCode (must be alphanumeric/underscore/dash, no path separators)",
+          })
+        }
+        if (input.scope.type === "user" && !isValidScopeIdentity(input.scope.userID)) {
+          return yield* new InvalidNameError({
+            name: input.name,
+            message: "Invalid userID (must be alphanumeric/underscore/dash, no path separators)",
+          })
+        }
         const scopePath = scopeDirName(input.scope)
         const dir = path.join(input.skillsRoot, scopePath, input.name)
         const filepath = path.join(dir, "SKILL.md")
         // Same-name check: refuse to silently overwrite an existing skill in
-        // the same scope directory. Cross-scope same names are allowed (each
-        // isolated by `list(userContext)`).
+        // the same scope directory. Cross-scope same names are allowed and kept
+        // distinct by `list`'s name+scope dedupe key; `list(userContext)`
+        // filters to the caller's visible scopes, so they stay isolated.
         if (yield* fs.existsSafe(filepath)) {
           return yield* new ConflictError({
             name: input.name,
