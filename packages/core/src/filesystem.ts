@@ -2,12 +2,12 @@ export * as FileSystem from "./filesystem"
 
 import { makeLocationNode } from "./effect/app-node"
 import path from "path"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Data, Effect, Layer, Schema } from "effect"
 import { FSUtil } from "./fs-util"
 import { Location } from "./location"
 import { PositiveInt, RelativePath } from "./schema"
 import { FileSystemSearch } from "./filesystem/search"
-import { Entry, FileSystem, FindInput, Match } from "@opencode-ai/schema/filesystem"
+import { Entry, FileSystem, FindInput, Match, UploadEntry } from "@opencode-ai/schema/filesystem"
 export { Entry, Match, Submatch } from "@opencode-ai/schema/filesystem"
 
 export const ReadInput = Schema.Struct({
@@ -46,12 +46,27 @@ export class GrepInput extends Schema.Class<GrepInput>("FileSystem.GrepInput")({
 
 export const Event = FileSystem.Event
 
+export class UploadError extends Data.TaggedError("UploadError")<{
+  readonly reason: "unsafe" | "not-found"
+}> {}
+
+function versionName(name: string, version: number) {
+  const dot = name.lastIndexOf(".")
+  return dot <= 0 ? `${name}-${version}` : `${name.slice(0, dot)}-${version}${name.slice(dot)}`
+}
+
 export interface Interface {
   readonly read: (input: ReadInput) => Effect.Effect<{ readonly content: Uint8Array; readonly mime: string }>
   readonly list: (input?: ListInput) => Effect.Effect<Entry[]>
   readonly find: (input: FindInput) => Effect.Effect<Entry[]>
   readonly glob: (input: GlobInput) => Effect.Effect<readonly Entry[]>
   readonly grep: (input: GrepInput) => Effect.Effect<readonly Match[]>
+  readonly upload: (input: { readonly name: string; readonly content: Uint8Array }) => Effect.Effect<
+    { readonly path: string; readonly name: string },
+    UploadError
+  >
+  readonly listUploads: () => Effect.Effect<UploadEntry[]>
+  readonly deleteUpload: (input: { readonly name: string }) => Effect.Effect<void, UploadError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/FileSystem") {}
@@ -106,6 +121,48 @@ const baseLayer = Layer.effect(
               .sort((a, b) => (a.type === b.type ? a.path.localeCompare(b.path) : a.type === "directory" ? -1 : 1)),
           ),
         )
+      }),
+      upload: Effect.fn("FileSystem.upload")(function* (input) {
+        const uploadsDir = path.join(location.directory, "uploads")
+        const absolute = path.join(uploadsDir, input.name)
+        const unsafe =
+          input.name.length === 0 ||
+          path.isAbsolute(input.name) ||
+          input.name.includes("/") ||
+          input.name.includes("\\") ||
+          !FSUtil.contains(uploadsDir, absolute)
+        if (unsafe) return yield* Effect.fail(new UploadError({ reason: "unsafe" }))
+        let version = 1
+        let candidate = input.name
+        while (yield* fs.existsSafe(path.join(uploadsDir, candidate))) {
+          candidate = versionName(input.name, version)
+          version += 1
+        }
+        yield* fs.ensureDir(uploadsDir).pipe(Effect.orDie)
+        yield* fs.writeFile(path.join(uploadsDir, candidate), input.content).pipe(Effect.orDie)
+        return { path: path.join("uploads", candidate), name: candidate }
+      }),
+      listUploads: Effect.fn("FileSystem.listUploads")(function* () {
+        const uploadsDir = path.join(location.directory, "uploads")
+        if (!(yield* fs.existsSafe(uploadsDir))) return []
+        const items = yield* fs.readDirectoryEntries(uploadsDir).pipe(Effect.orDie)
+        return items
+          .filter((item) => item.type === "file")
+          .map((item) => UploadEntry.make({ name: item.name, path: path.join("uploads", item.name) }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+      }),
+      deleteUpload: Effect.fn("FileSystem.deleteUpload")(function* (input) {
+        const uploadsDir = path.join(location.directory, "uploads")
+        const absolute = path.join(uploadsDir, input.name)
+        const unsafe =
+          input.name.length === 0 ||
+          path.isAbsolute(input.name) ||
+          input.name.includes("/") ||
+          input.name.includes("\\") ||
+          !FSUtil.contains(uploadsDir, absolute)
+        if (unsafe) return yield* Effect.fail(new UploadError({ reason: "unsafe" }))
+        if (!(yield* fs.existsSafe(absolute))) return yield* Effect.fail(new UploadError({ reason: "not-found" }))
+        yield* fs.remove(absolute).pipe(Effect.orDie)
       }),
     })
   }),
