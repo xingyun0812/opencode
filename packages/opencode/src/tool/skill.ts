@@ -1,6 +1,8 @@
 import path from "path"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
+import { UserContext } from "@opencode-ai/schema/user-context"
+import { AuthToken } from "@opencode-ai/schema/auth-token"
 import { Skill } from "../skill"
 import * as Tool from "./tool"
 import DESCRIPTION from "./skill.txt"
@@ -23,6 +25,17 @@ export const SkillTool = Tool.define(
           const info = yield* skill
             .require(params.name)
             .pipe(Effect.catchTag("Skill.NotFoundError", (error) => Effect.die(new Error(error.message))))
+
+          // Resolve the live auth context (identity + raw Bearer credential) for
+          // this request's fiber. The HTTP middleware injects both during an
+          // authenticated session; fiber inheritance surfaces them here as Some.
+          // Unauthenticated/Basic-Auth paths yield None. Skill content can drive
+          // bash/webfetch to call business backends; those tools read AuthToken
+          // themselves, but exposing it on the skill tool too lets skill logic
+          // that needs the credential reach it directly. Never printed to output.
+          const userContext = Option.getOrUndefined(yield* Effect.serviceOption(UserContext.Service))
+          const authToken = Option.getOrUndefined(yield* Effect.serviceOption(AuthToken.Service))
+          void authToken // surfaced for skill-driven logic; not emitted below
 
           yield* ctx.ask({
             permission: "skill",
@@ -62,6 +75,7 @@ export const SkillTool = Tool.define(
             metadata: {
               name: info.name,
               dir,
+              authenticated: !!userContext,
             },
           }
         }).pipe(Effect.orDie),

@@ -1,7 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Cause, Effect, Exit, Layer, Redacted } from "effect"
 import type * as Scope from "effect/Scope"
 import os from "os"
 import path from "path"
@@ -19,6 +19,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Plugin } from "../../src/plugin"
 import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
+import { AuthToken } from "@opencode-ai/schema/auth-token"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
 
@@ -190,6 +191,31 @@ describe("tool.shell", () => {
         })
         expect(result.metadata.exit).toBe(0)
         expect(result.metadata.output).toContain("test")
+      }),
+    ),
+  )
+
+  each("exposes the bearer token to the child process when authenticated", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const result = yield* run({ command: 'echo "${OPENCODE_USER_BEARER_TOKEN:-NONE}"' }).pipe(
+          Effect.provideService(AuthToken.Service, { token: Redacted.make("shell-test-jwt") }),
+        )
+        expect(result.metadata.exit).toBe(0)
+        expect(result.metadata.output).toContain("shell-test-jwt")
+      }),
+    ),
+  )
+
+  each("does not expose the bearer token when unauthenticated", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const result = yield* run({ command: 'echo "${OPENCODE_USER_BEARER_TOKEN:-NONE}"' })
+        expect(result.metadata.exit).toBe(0)
+        expect(result.metadata.output).toContain("NONE")
+        expect(result.metadata.output).not.toContain("jwt")
       }),
     ),
   )

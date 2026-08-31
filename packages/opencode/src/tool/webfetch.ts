@@ -1,9 +1,10 @@
-import { Effect, Schema } from "effect"
+import { Effect, Option, Redacted, Schema } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { Parser } from "htmlparser2"
 import * as Tool from "./tool"
 import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
+import { AuthToken } from "@opencode-ai/schema/auth-token"
 import { isImageAttachment } from "@/util/media"
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
@@ -73,7 +74,16 @@ export const WebFetchTool = Tool.define(
             "Accept-Language": "en-US,en;q=0.9",
           }
 
-          const request = HttpClientRequest.get(params.url).pipe(HttpClientRequest.setHeaders(headers))
+          // Re-attach the current user's Bearer credential when present (JWT
+          // session). None for unauthenticated/Basic-Auth — no Authorization
+          // header is added, preserving today's behavior. The Redacted secret is
+          // unsealed only here to build the header; it never reaches model output.
+          const authToken = Option.getOrUndefined(yield* Effect.serviceOption(AuthToken.Service))
+          const authHeaders = authToken ? { Authorization: `Bearer ${Redacted.value(authToken.token)}` } : {}
+
+          const request = HttpClientRequest.get(params.url).pipe(
+            HttpClientRequest.setHeaders({ ...headers, ...authHeaders }),
+          )
 
           // Retry with honest UA if blocked by Cloudflare bot detection (TLS fingerprint mismatch)
           const response = yield* httpOk.execute(request).pipe(
@@ -85,7 +95,7 @@ export const WebFetchTool = Tool.define(
               () =>
                 httpOk.execute(
                   HttpClientRequest.get(params.url).pipe(
-                    HttpClientRequest.setHeaders({ ...headers, "User-Agent": "opencode" }),
+                    HttpClientRequest.setHeaders({ ...headers, ...authHeaders, "User-Agent": "opencode" }),
                   ),
                 ),
             ),
