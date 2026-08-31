@@ -20,6 +20,16 @@ export const Plugin = define({
         const entries = yield* config.entries()
         const directories = entries.flatMap((entry) => (entry.type === "directory" ? [entry.path] : []))
         const items = entries.flatMap((entry) => (entry.type === "document" ? (entry.info.skills ?? []) : []))
+        // The active Location directory is the `skillsRoot` that the HTTP
+        // `skill.create` handler and the conversation `skill` tool write to
+        // (`<location.directory>/<scopeDir>/<name>/SKILL.md`). Register it as a
+        // source so created skills are discovered by `list`. `parseScopeDir`
+        // only treats `global`/`dept_*`/`user_*` direct children as scope dirs,
+        // so a flat `skill/`/`skills/` sibling (registered separately below) is
+        // not misread as a scope.
+        draft.source(
+          SkillV2.DirectorySource.make({ type: "directory", path: AbsolutePath.make(location.directory) }),
+        )
         for (const directory of directories) {
           draft.source(
             SkillV2.DirectorySource.make({ type: "directory", path: AbsolutePath.make(path.join(directory, "skill")) }),

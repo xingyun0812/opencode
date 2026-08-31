@@ -35,6 +35,27 @@ export const available = (skills: ReadonlyArray<Info>, agent: AgentV2.Info) =>
 
 const SCOPE_GLOBAL = "global"
 
+// A skill name must be lowercase, non-empty, and free of path separators or
+// traversal sequences — it becomes a directory name on disk
+// (`<skillsRoot>/<scopeDir>/<name>/SKILL.md`).
+const SKILL_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/
+function isValidSkillName(name: string): boolean {
+  if (!name) return false
+  if (name.includes("..")) return false
+  if (/[\/\\]/.test(name)) return false
+  return SKILL_NAME_RE.test(name)
+}
+
+// Scope identity fields (departmentCode/userID) become path segments on disk
+// (`<skillsRoot>/dept_<code>/...` / `user_<id>/...`), so they must not carry
+// path separators or traversal sequences. They originate from JWT claims / the
+// request body, so validating at the write boundary closes a path-traversal
+// vector independent of how identity is supplied.
+const SCOPE_IDENTITY_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/
+function isValidScopeIdentity(value: unknown): boolean {
+  return typeof value === "string" && !value.includes("..") && SCOPE_IDENTITY_RE.test(value)
+}
+
 function parseScopeDir(dirname: string): { type: "global" | "department" | "user"; owner?: string } | undefined {
   if (dirname === SCOPE_GLOBAL) return { type: "global" }
   const deptMatch = dirname.match(/^dept_(.+)$/)
@@ -65,12 +86,100 @@ function parseScope(info: Skill.Info): Skill.Info {
   return { ...info, scope: { type: "global" } }
 }
 
+// A stable string identity for a skill's scope, used to dedupe across sources
+// WITHOUT collapsing cross-scope same-name skills into one another. Deduping by
+// `skill.name` alone would let a `user_u2/deploy` loaded later overwrite a
+// `user_u1/deploy` loaded earlier in the Map, so `list(u1)` could lose u1's own
+// skill entirely — breaking read isolation. Keying by name+scope preserves both.
+function scopeKey(scope: Skill.Info["scope"]): string {
+  if (!scope || scope.type === "global") return "global"
+  if (scope.type === "department") return `dept_${scope.departmentCode}`
+  return `user_${scope.userID}`
+}
+
 const Frontmatter = Schema.Struct({
   name: Schema.String.pipe(Schema.optional),
   description: Schema.String.pipe(Schema.optional),
   slash: Schema.Boolean.pipe(Schema.optional),
 })
 const decodeFrontmatter = Schema.decodeUnknownOption(Frontmatter)
+
+// ─── Scope access (shared by HTTP handler + conversation tool) ────
+
+// The requested-by-client scope shape: type plus optional identity fields.
+// Identity fields are only honored for `global_admin` (which may target any
+// department); ordinary users are pinned to their own identity by
+// `resolveCreateScope` before this is called.
+export type RequestedScope = {
+  type: "global" | "department" | "user"
+  departmentCode?: string
+  userID?: string
+}
+
+// The resolved scope that `create` writes to disk: identity is always present.
+export type ResolvedScope =
+  | { type: "global" }
+  | { type: "department"; departmentCode: string }
+  | { type: "user"; userID: string }
+
+// Check whether `userContext` may manage `scope`. Read-only paths call this
+// with `userContext === undefined` (returns void — passthrough); the create
+// path gates absence itself before calling. Department scope is open to any
+// member of the target department (any role), not restricted to `dept_admin`;
+// `global_admin` short-circuits to allow. `global`/`user` rules are unchanged.
+export function checkScopeAccess(
+  userContext: UserContext.Info | undefined,
+  scope: RequestedScope,
+): Effect.Effect<void, ForbiddenError> {
+  if (!userContext) return Effect.void
+  switch (scope.type) {
+    case "global":
+      if (userContext.role === "global_admin") return Effect.void
+      return Effect.fail(new ForbiddenError({ message: "Only global administrators can manage global skills" }))
+    case "department":
+      if (userContext.role === "global_admin") return Effect.void
+      if (userContext.departmentCode === undefined) {
+        return Effect.fail(new ForbiddenError({ message: "You are not a member of any department" }))
+      }
+      if (scope.departmentCode !== userContext.departmentCode) {
+        return Effect.fail(new ForbiddenError({ message: "You can only manage skills in your own department" }))
+      }
+      return Effect.void
+    case "user":
+      if (scope.userID !== undefined && scope.userID !== userContext.userID) {
+        return Effect.fail(new ForbiddenError({ message: "You can only manage your own personal skills" }))
+      }
+      return Effect.void
+  }
+}
+
+// Resolve the scope the create path will actually write, enforcing identity
+// from `userContext` for ordinary users. `global_admin` keeps the requested
+// scope (it may create for any department, so its departmentCode comes from
+// the request body); everyone else is pinned to their own identity.
+export function resolveCreateScope(
+  userContext: UserContext.Info,
+  requested: RequestedScope,
+): Effect.Effect<ResolvedScope, ForbiddenError> {
+  const isGlobalAdmin = userContext.role === "global_admin"
+  if (requested.type === "department") {
+    const departmentCode = isGlobalAdmin ? requested.departmentCode : userContext.departmentCode
+    if (departmentCode === undefined) {
+      return Effect.fail(
+        new ForbiddenError({
+          message: isGlobalAdmin
+            ? "Creating a department skill requires a departmentCode"
+            : "You are not a member of any department",
+        }),
+      )
+    }
+    return Effect.succeed({ type: "department", departmentCode })
+  }
+  if (requested.type === "user") {
+    return Effect.succeed({ type: "user", userID: userContext.userID })
+  }
+  return Effect.succeed({ type: "global" })
+}
 
 export type Data = {
   sources: Types.DeepMutable<Source>[]
@@ -90,7 +199,7 @@ export interface Interface extends State.Transformable<Draft> {
     content: string
     scope: { type: "global" } | { type: "department"; departmentCode: string } | { type: "user"; userID: string }
     skillsRoot: string
-  }) => Effect.Effect<Info>
+  }) => Effect.Effect<Info, ConflictError | InvalidNameError>
   readonly update: (input: {
     name: string
     description?: string
@@ -100,6 +209,28 @@ export interface Interface extends State.Transformable<Draft> {
 }
 
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("SkillV2.NotFoundError", {
+  name: Schema.String,
+  message: Schema.String,
+}) {}
+
+// Raised by `checkScopeAccess` / `resolveCreateScope` when the current user is
+// not allowed to manage the requested scope. Core-owned so the skill service,
+// the HTTP handler, and the conversation tool all share one implementation; each
+// call site maps it to its own error shape (HTTP 403 ForbiddenError, tool ToolFailure).
+export class ForbiddenError extends Schema.TaggedErrorClass<ForbiddenError>()("SkillV2.ForbiddenError", {
+  message: Schema.String,
+}) {}
+
+// Raised by `create` when a skill with the same name already exists in the
+// target scope directory. Call sites map to HTTP 409 SkillNameConflictError /
+// tool ToolFailure.
+export class ConflictError extends Schema.TaggedErrorClass<ConflictError>()("SkillV2.ConflictError", {
+  name: Schema.String,
+  message: Schema.String,
+}) {}
+
+// Raised by `create` when the requested name is not a legal skill name.
+export class InvalidNameError extends Schema.TaggedErrorClass<InvalidNameError>()("SkillV2.InvalidNameError", {
   name: Schema.String,
   message: Schema.String,
 }) {}
@@ -167,11 +298,15 @@ const layer = Layer.effect(
           }
         }
 
-        // Process flat directories (migration compat: existing skills outside any scope dir)
+        // Process flat directories (migration compat: existing skills outside any scope dir).
+        // Only `SKILL.md` files are recognized here so that unrelated markdown in
+        // sibling directories of the skills root (e.g. plans/notes with
+        // frontmatter) is not misread as a global skill. The legacy
+        // `<dir>/<name>.md` flat layout is only honored inside scope directories.
         for (const flatDir of flatDirs) {
           const flatPath = path.join(directory, flatDir.name)
           const files = yield* fs
-            .glob("{*.md,**/SKILL.md}", {
+            .glob("**/SKILL.md", {
               cwd: flatPath,
               absolute: true,
               include: "file",
@@ -185,10 +320,13 @@ const layer = Layer.effect(
           }
         }
 
-        // Also handle top-level markdown files (completely flat structure with no subdirectories)
+        // Also handle top-level markdown files (completely flat structure with no subdirectories).
+        // Same SKILL.md-only rule: registering the skills root itself as a source
+        // would otherwise let the project root's README/notes (any .md with
+        // frontmatter) leak in as global skills.
         if (dirs.length === 0) {
           const files = yield* fs
-            .glob("{*.md,**/SKILL.md}", {
+            .glob("**/SKILL.md", {
               cwd: directory,
               absolute: true,
               include: "file",
@@ -232,11 +370,7 @@ const layer = Layer.effect(
       }
     }
 
-    function scopeDirName(scope: {
-      type: "global" | "department" | "user"
-      departmentCode: string
-      userID: string
-    }): string {
+    function scopeDirName(scope: ResolvedScope): string {
       switch (scope.type) {
         case "global": return "global"
         case "department": return `dept_${scope.departmentCode}`
@@ -249,12 +383,15 @@ const layer = Layer.effect(
       cache.clear()
     }
     const list = Effect.fn("SkillV2.list")(function* (userContext?: UserContext.Info) {
+      // Key by name+scope so cross-scope same-name skills (e.g. user_u1/deploy
+      // and user_u2/deploy) survive source merge instead of one overwriting
+      // the other — only then does per-user filtering pick the right one.
       const skills = new Map<string, Info>()
       for (const source of state.get().sources) {
         const key = Source.key(source)
         const loaded = cache.get(key) ?? (yield* load(source))
         cache.set(key, loaded)
-        for (const skill of loaded) skills.set(skill.name, skill)
+        for (const skill of loaded) skills.set(`${scopeKey(skill.scope)}@${skill.name}`, skill)
       }
       const all = Array.from(skills.values())
 
@@ -277,9 +414,42 @@ const layer = Layer.effect(
       }),
       list,
       create: Effect.fn("SkillV2.create")(function* (input) {
+        // Name validation: lowercase, no spaces/path separators/traversal.
+        // Mirrors the on-disk layout (<skillsRoot>/<scopeDir>/<name>/SKILL.md)
+        // so a bad name can never escape its scope directory.
+        if (!isValidSkillName(input.name)) {
+          return yield* new InvalidNameError({
+            name: input.name,
+            message: `Invalid skill name: ${input.name} (must be lowercase, no spaces or path separators)`,
+          })
+        }
+        // Scope-identity validation: departmentCode/userID become path segments,
+        // so reject separators/traversal to prevent escaping skillsRoot.
+        if (input.scope.type === "department" && !isValidScopeIdentity(input.scope.departmentCode)) {
+          return yield* new InvalidNameError({
+            name: input.name,
+            message: "Invalid departmentCode (must be alphanumeric/underscore/dash, no path separators)",
+          })
+        }
+        if (input.scope.type === "user" && !isValidScopeIdentity(input.scope.userID)) {
+          return yield* new InvalidNameError({
+            name: input.name,
+            message: "Invalid userID (must be alphanumeric/underscore/dash, no path separators)",
+          })
+        }
         const scopePath = scopeDirName(input.scope)
         const dir = path.join(input.skillsRoot, scopePath, input.name)
         const filepath = path.join(dir, "SKILL.md")
+        // Same-name check: refuse to silently overwrite an existing skill in
+        // the same scope directory. Cross-scope same names are allowed and kept
+        // distinct by `list`'s name+scope dedupe key; `list(userContext)`
+        // filters to the caller's visible scopes, so they stay isolated.
+        if (yield* fs.existsSafe(filepath)) {
+          return yield* new ConflictError({
+            name: input.name,
+            message: `A skill named ${input.name} already exists in this scope`,
+          })
+        }
         const frontmatter: Record<string, string | undefined> = { name: input.name }
         if (input.description) frontmatter.description = input.description
         const frontmatterStr = Object.entries(frontmatter)

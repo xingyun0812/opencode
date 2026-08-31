@@ -2,8 +2,10 @@ import fs from "fs/promises"
 import path from "path"
 import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
+import { UserContext } from "@opencode-ai/schema/user-context"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Location } from "@opencode-ai/core/location"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -11,6 +13,7 @@ import { SkillV2 } from "@opencode-ai/core/skill"
 import { SkillTool } from "@opencode-ai/core/tool/skill"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
+import { location as locationRef } from "./fixture/location"
 import { tmpdir } from "./fixture/tmpdir"
 import { it } from "./lib/effect"
 import { toolIdentity, executeTool, settleTool, toolDefinitions } from "./lib/tool"
@@ -63,6 +66,9 @@ describe("SkillTool", () => {
               reload: () => Effect.die("unused"),
               sources: () => Effect.die("unused"),
               list: () => Effect.succeed(current),
+              create: () => Effect.die("unused"),
+              update: () => Effect.die("unused"),
+              remove: () => Effect.die("unused"),
             }),
           )
           const skillToolLayer = AppNodeBuilder.build(
@@ -70,6 +76,7 @@ describe("SkillTool", () => {
             [
               [PermissionV2.node, permission],
               [SkillV2.node, skills],
+              [Location.node, Layer.succeed(Location.Service, Location.Service.of(locationRef(Location.Ref.make({ directory: AbsolutePath.make(tmp.path) }))))],
               [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
             ],
           )
@@ -143,6 +150,270 @@ describe("SkillTool", () => {
             ).toEqual({ type: "text", value: SkillTool.toModelOutput(flat, []) })
           }).pipe(Effect.provide(skillToolLayer))
         }),
+      ),
+    ),
+  )
+})
+
+function userContext(partial: Partial<UserContext.Info> = {}): UserContext.Info {
+  return {
+    userID: "u1",
+    username: "alice",
+    departmentCode: "D1",
+    role: "user",
+    permissions: [],
+    ...partial,
+  }
+}
+
+const allowPermission = Layer.succeed(
+  PermissionV2.Service,
+  PermissionV2.Service.of({
+    assert: () => Effect.void,
+    ask: () => Effect.die("unused"),
+    reply: () => Effect.die("unused"),
+    get: () => Effect.die("unused"),
+    forSession: () => Effect.die("unused"),
+    list: () => Effect.die("unused"),
+  }),
+)
+
+describe("SkillTool create", () => {
+  // Builds a real skill-tool layer against a temp Location directory so created
+  // skills land on disk and can be read back. SkillV2/FSUtil/SkillDiscovery use
+  // their default (real) layers; only Permission/Location/ToolOutputStore are
+  // overridden. UserContext is injected per-call via Effect.provideService.
+  function realLayer(tmpPath: string) {
+    return AppNodeBuilder.build(
+      LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, SkillTool.node]),
+      [
+        [PermissionV2.node, allowPermission],
+        [Location.node, Layer.succeed(Location.Service, Location.Service.of(locationRef(Location.Ref.make({ directory: AbsolutePath.make(tmpPath) }))))],
+        [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
+      ],
+    )
+  }
+
+  it.live("creates a personal (user) skill for an authenticated user and writes to user_<id>/", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-user", name: "skill", input: { action: "create", name: "my-skill", content: "# Mine\n\nSteps" } },
+          })
+          expect(result).toMatchObject({ type: "text" })
+          const onDisk = (yield* Effect.promise(() =>
+            fs.readFile(path.join(tmp.path, "user_u1", "my-skill", "SKILL.md"), "utf8"),
+          )) as string
+          expect(onDisk).toContain("name: my-skill")
+          expect(onDisk).toContain("# Mine")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext())),
+      ),
+    ),
+  )
+
+  it.live("creates a department skill pinned to the caller's department", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-dept", name: "skill", input: { action: "create", name: "team-skill", scope: { type: "department" }, content: "# Team" } },
+          })
+          expect(result).toMatchObject({ type: "text" })
+          expect(
+            (yield* Effect.promise(() =>
+              fs.readFile(path.join(tmp.path, "dept_D1", "team-skill", "SKILL.md"), "utf8"),
+            )) as string,
+          ).toContain("name: team-skill")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext({ departmentCode: "D1" }))),
+      ),
+    ),
+  )
+
+  it.live("refuses to create without an authenticated user context", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          // No UserContext provided → serviceOption yields None.
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-noauth", name: "skill", input: { action: "create", name: "x", content: "y" } },
+          })
+          expect(result).toEqual({ type: "error", value: "Creating skills requires an authenticated user context" })
+        }).pipe(Effect.provide(realLayer(tmp.path))),
+      ),
+    ),
+  )
+
+  it.live("refuses contentless create with a clear message", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-nocontent", name: "skill", input: { action: "create", name: "x" } },
+          })
+          expect(result).toEqual({ type: "error", value: "Creating a skill requires `content` (the SKILL.md body)" })
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext())),
+      ),
+    ),
+  )
+
+  it.live("rejects a plain user creating a global skill (only global_admin)", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-global-deny", name: "skill", input: { action: "create", name: "g", scope: { type: "global" }, content: "g" } },
+          })
+          expect(result).toMatchObject({ type: "error" })
+          if (result.type === "error") expect(result.value).toContain("Only global administrators")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext({ role: "user" }))),
+      ),
+    ),
+  )
+
+  it.live("allows a global_admin to create a global skill", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-global-ok", name: "skill", input: { action: "create", name: "g", scope: { type: "global" }, content: "g" } },
+          })
+          expect(result).toMatchObject({ type: "text" })
+          expect(
+            (yield* Effect.promise(() => fs.readFile(path.join(tmp.path, "global", "g", "SKILL.md"), "utf8"))) as string,
+          ).toContain("name: g")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext({ role: "global_admin" }))),
+      ),
+    ),
+  )
+
+  it.live("lets a global_admin create a department skill for a target department via scope.departmentCode", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          // global_admin has no department of their own; they specify the target
+          // department via scope.departmentCode. ordinary users cannot do this —
+          // resolveCreateScope pins them to their own departmentCode regardless.
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-admin-dept", name: "skill", input: { action: "create", name: "team", scope: { type: "department", departmentCode: "D9" }, content: "# Team" } },
+          })
+          expect(result).toMatchObject({ type: "text" })
+          expect(
+            (yield* Effect.promise(() => fs.readFile(path.join(tmp.path, "dept_D9", "team", "SKILL.md"), "utf8"))) as string,
+          ).toContain("name: team")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext({ role: "global_admin", departmentCode: undefined }))),
+      ),
+    ),
+  )
+
+  it.live("pins an ordinary user's department create to their own department (ignores scope.departmentCode)", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          // A plain user tries to target D9; identity enforcement pins them to
+          // their own D1, so the skill lands in dept_D1 — not D9.
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-user-dept-pinned", name: "skill", input: { action: "create", name: "team", scope: { type: "department", departmentCode: "D9" }, content: "# Team" } },
+          })
+          expect(result).toMatchObject({ type: "text" })
+          expect(
+            (yield* Effect.promise(() => fs.readFile(path.join(tmp.path, "dept_D1", "team", "SKILL.md"), "utf8"))) as string,
+          ).toContain("name: team")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext({ role: "user", departmentCode: "D1" }))),
+      ),
+    ),
+  )
+
+  it.live("rejects a same-name create in the same scope (ConflictError → ToolFailure)", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          const first = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-dup-1", name: "skill", input: { action: "create", name: "dup", content: "first" } },
+          })
+          expect(first).toMatchObject({ type: "text" })
+          const second = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-dup-2", name: "skill", input: { action: "create", name: "dup", content: "second" } },
+          })
+          expect(second).toMatchObject({ type: "error" })
+          if (second.type === "error") expect(second.value).toContain("already exists")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext())),
+      ),
+    ),
+  )
+
+  it.live("rejects an invalid skill name (InvalidNameError → ToolFailure)", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const registry = yield* ToolRegistry.Service
+          const result = yield* executeTool(registry, {
+            sessionID,
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call-create-badname", name: "skill", input: { action: "create", name: "Bad Name", content: "x" } },
+          })
+          expect(result).toMatchObject({ type: "error" })
+          if (result.type === "error") expect(result.value).toContain("Invalid skill name")
+        }).pipe(Effect.provide(realLayer(tmp.path)), Effect.provideService(UserContext.Service, userContext())),
       ),
     ),
   )

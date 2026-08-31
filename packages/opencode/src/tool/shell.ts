@@ -1,4 +1,5 @@
-import { Effect, Stream } from "effect"
+import { Effect, Option, Redacted, Stream } from "effect"
+import { AuthToken } from "@opencode-ai/schema/auth-token"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -419,9 +420,15 @@ export const ShellTool = Tool.define(
         { cwd, sessionID: ctx.sessionID, callID: ctx.callID },
         { env: {} },
       )
+      // Expose the current user's Bearer credential to the child process only
+      // during an authenticated (JWT) session. Unauthenticated/Basic-Auth paths
+      // omit it, so local shells never see a token that doesn't belong to them.
+      // The Redacted secret is unsealed only here to set the env entry.
+      const authToken = Option.getOrUndefined(yield* Effect.serviceOption(AuthToken.Service))
       return {
         ...process.env,
         ...extra.env,
+        ...(authToken ? { OPENCODE_USER_BEARER_TOKEN: Redacted.value(authToken.token) } : {}),
       }
     })
 

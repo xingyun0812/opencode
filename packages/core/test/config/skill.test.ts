@@ -59,6 +59,10 @@ describe("ConfigSkillPlugin.Plugin", () => {
       )
 
       expect(sources).toEqual([
+        // The active Location directory is registered as a source so skills
+        // created via HTTP / the conversation tool (which write to
+        // `<location.directory>/<scopeDir>/<name>/SKILL.md`) are discoverable.
+        SkillV2.DirectorySource.make({ type: "directory", path: AbsolutePath.make(directory) }),
         SkillV2.DirectorySource.make({
           type: "directory",
           path: AbsolutePath.make(path.join("/repo/.opencode", "skill")),

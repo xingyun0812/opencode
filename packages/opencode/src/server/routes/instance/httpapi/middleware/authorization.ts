@@ -1,5 +1,6 @@
 import { ServerAuth } from "@/server/auth"
 import { UserContext } from "@opencode-ai/schema/user-context"
+import { AuthToken } from "@opencode-ai/schema/auth-token"
 import { UnauthorizedError } from "@opencode-ai/protocol/errors"
 import { Effect, Encoding, Layer, Option, Redacted } from "effect"
 import { HttpEffect, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
@@ -205,7 +206,17 @@ export const authorizationLayer = Layer.effect(
           }
           const result = yield* verifyJwt(bearerToken, jwtSecret).pipe(Effect.option)
           if (Option.isSome(result)) {
-            return yield* effect.pipe(Effect.provideService(UserContext.Service, result.value))
+            // Inject both the decoded identity (UserContext) and the raw
+            // Bearer credential (AuthToken). Tools in the conversation fiber
+            // read AuthToken via `Effect.serviceOption(AuthToken.Service)` to
+            // re-attach `Authorization: Bearer` when calling business backends
+            // on the user's behalf. Redacted-wrapped so the secret never leaks
+            // through logs/model output. Basic-Auth/unauthenticated paths stay
+            // `None` (no Bearer token exists).
+            return yield* effect.pipe(
+              Effect.provideService(UserContext.Service, result.value),
+              Effect.provideService(AuthToken.Service, { token: Redacted.make(bearerToken) }),
+            )
           }
           // JWT present but invalid — do NOT fall back to Basic Auth
           yield* HttpEffect.appendPreResponseHandler((_request, response) =>

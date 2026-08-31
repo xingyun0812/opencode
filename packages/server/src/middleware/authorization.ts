@@ -61,7 +61,9 @@ export const authorizationLayer = Layer.effect(
             // JWT secret not configured, skip JWT validation
             // Fall through to checking credentials below
           } else {
-            const userContext = yield* ServerAuth.validateJwt(bearerToken)
+            const userContext = yield* ServerAuth.validateJwt(bearerToken).pipe(
+              Effect.provideService(ServerAuth.JwtConfig, jwtSecret),
+            )
             if (Option.isSome(userContext)) {
               // Inject UserContext into the effect context
               return yield* effect.pipe(Effect.provideService(UserContext.Service, userContext.value))

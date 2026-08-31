@@ -1,13 +1,14 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Redacted } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { WebFetchTool } from "../../src/tool/webfetch"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { Tool } from "@/tool/tool"
+import { AuthToken } from "@opencode-ai/schema/auth-token"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(
@@ -114,6 +115,52 @@ describe("tool.webfetch", () => {
           expect(result.output).toBe("Hello world")
           expect(result.attachments).toBeUndefined()
         }),
+    ),
+  )
+
+  // Captures the outbound Authorization header so auth-injection tests can
+  // assert on it without coupling to internal plumbing.
+  const withHeaderCapture = (
+    fetch: (req: Request) => Response | Promise<Response>,
+    fn: (url: URL, captured: () => string | null) => Effect.Effect<void, any, any>,
+  ) =>
+    Effect.gen(function* () {
+      let captured: string | null = null
+      yield* withFetch(
+        (req) => {
+          captured = req.headers.get("authorization")
+          return fetch(req)
+        },
+        (url) => fn(url, () => captured),
+      )
+    })
+
+  it.instance("attaches Authorization Bearer when AuthToken is present", () =>
+    withHeaderCapture(
+      () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+      (url, captured) =>
+        exec({ url: new URL("/file.txt", url).toString(), format: "text" }).pipe(
+          Effect.provideService(AuthToken.Service, { token: Redacted.make("test-jwt-token") }),
+          Effect.flatMap(() =>
+            Effect.sync(() => {
+              expect(captured()).toBe("Bearer test-jwt-token")
+            }),
+          ),
+        ),
+    ),
+  )
+
+  it.instance("omits Authorization header when no AuthToken is present", () =>
+    withHeaderCapture(
+      () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+      (url, captured) =>
+        exec({ url: new URL("/file.txt", url).toString(), format: "text" }).pipe(
+          Effect.flatMap(() =>
+            Effect.sync(() => {
+              expect(captured()).toBeNull()
+            }),
+          ),
+        ),
     ),
   )
 })
